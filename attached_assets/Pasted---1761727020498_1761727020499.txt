@@ -1,0 +1,144 @@
+# واجهة تسجيل الجلسة — بموافقة مسبقة وتحويل صوتي مباشر بدون حفظ التسجيل
+
+منصة إلكترونية هادئة ومريحة تتيح للمستفيدين مشاركة جلساتهم بشكل سري بعد الموافقة، حيث يتم تحويل الصوت إلى نص فوري دون حفظ أي تسجيل صوتي. النص يُخزَّن فقط لغرض التحليل وتحسين خدمات الصلح والإرشاد.
+
+---
+
+## 🎯 التدفق العام للتجربة
+
+**الفكرة العامة:** واجهة عربية هادئة، تشجّع المستفيد على المشاركة بعبارة دافئة ومحفّزة:
+
+> **شارك تجربتك بسرية لتحسين خدماتنا**
+
+**النص المساند:**
+
+> سيتم تحويل كلامك إلى نص بشكل فوري لتحسين خدماتنا. لا يتم حفظ أي تسجيل صوتي.
+
+**زر البداية:**
+
+> ابدأ المشاركة الآن
+
+**التدفق:**
+
+1. تظهر البطاقة الافتتاحية بعنوان العبارة أعلاه وزر “ابدأ المشاركة الآن”.
+2. عند النقر، تُعرض نافذة **الموافقة على التسجيل** (النص الكامل مأخوذ من نموذجك العربي المرفق).
+3. بعد الموافقة، يُطلب من المستخدم تعبئة **استبيان قصير** (تاريخ الجلسة، عدد الأطراف، نوع العلاقة، هل يوجد أطفال متأثرون بالخلاف؟).
+4. بعد الإرسال، **تُعتّم الشاشة تدريجيًا** لتصبح مظلمة ومريحة.
+5. **يبدأ الاستماع بهدوء** باستخدام Google Cloud Speech-to-Text مع التعرف على عدة متحدثين (Diarization)، دون حفظ أي صوت.
+6. عند توقف الكلام لوقت محدد (مثل 20 ثانية)، **تنتهي الجلسة تلقائيًا** ويُحفظ النص فقط في قاعدة البيانات.
+7. تُعاد الواجهة إلى حالتها الأصلية بعبارة شكر واستعداد لزائر جديد.
+
+---
+
+## ⚙️ المكوّنات التقنية المقترحة
+
+| الوظيفة               | التقنية                                    |
+| --------------------- | ------------------------------------------ |
+| الواجهة               | React (Next.js) + TailwindCSS + دعم RTL    |
+| التحويل الصوتي إلى نص | Google Speech-to-Text مع تفعيل Diarization |
+| الخادم                | FastAPI (Python) عبر WebSocket             |
+| قاعدة البيانات        | PostgreSQL (Cloud SQL أو DigitalOcean)     |
+| الاستضافة             | Cloud Run أو Firebase Hosting              |
+
+---
+
+## 🧩 الواجهة الأمامية (React + Tailwind)
+
+تدعم اللغة العربية واتجاه النص من اليمين إلى اليسار.
+
+```tsx
+// app/page.tsx
+'use client';
+import React, { useState, useRef, useEffect } from 'react';
+
+export default function ArabicSession() {
+  const [phase, setPhase] = useState<'cta'|'consent'|'survey'|'recording'|'done'>('cta');
+  const [consented, setConsented] = useState(false);
+  const [name, setName] = useState('');
+  const [survey, setSurvey] = useState({ participants: 2, relation: 'زوجان', children: false });
+  const [dim, setDim] = useState(false);
+
+  async function startRecording() {
+    setDim(true);
+    setPhase('recording');
+    const init = await fetch('/api/session/init', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ consented, name, survey })
+    }).then(r => r.json());
+    const ws = new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/transcribe?session_id=${init.session_id}`);
+    const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    const ctx = new AudioContext();
+    const source = ctx.createMediaStreamSource(stream);
+    const processor = ctx.createScriptProcessor(4096,1,1);
+    processor.onaudioprocess = e => {
+      const data = e.inputBuffer.getChannelData(0);
+      const pcm = new Int16Array(data.length);
+      for (let i=0;i<data.length;i++){ pcm[i]=data[i]*0x7fff; }
+      ws.send(pcm.buffer);
+    };
+    source.connect(processor);
+    processor.connect(ctx.destination);
+    ws.onclose = ()=>{ setDim(false); setPhase('done'); };
+  }
+
+  return (
+    <div dir="rtl" className={`min-h-screen flex items-center justify-center transition-colors duration-700 ${dim?'bg-black':'bg-gray-50'}`}>
+      <div className={`max-w-lg w-full text-right transition-opacity duration-700 ${dim?'opacity-0':'opacity-100'}`}>
+        {phase==='cta' && (
+          <div className="bg-white rounded-2xl shadow-xl p-8">
+            <h1 className="text-2xl font-bold mb-2">شارك تجربتك بسرية لتحسين خدماتنا</h1>
+            <p className="text-gray-600 mb-6">سيتم تحويل كلامك إلى نص بشكل فوري لتحسين خدماتنا. لا يتم حفظ أي تسجيل صوتي.</p>
+            <button onClick={()=>setPhase('consent')} className="bg-black text-white px-6 py-3 rounded-xl">ابدأ المشاركة الآن</button>
+          </div>
+        )}
+
+        {phase==='consent' && (
+          <div className="bg-white rounded-2xl shadow-xl p-8">
+            <h2 className="text-xl font-semibold mb-3">الموافقة على التسجيل</h2>
+            <ul className="text-sm text-gray-700 list-disc pr-5 space-y-1 mb-4">
+              <li>سيتم تحويل الجلسة إلى نص لأغراض البحث وتحسين الخدمة فقط.</li>
+              <li>لن يتم حفظ أي تسجيل صوتي بعد تحويله.</li>
+              <li>المشاركة اختيارية ولا تؤثر على خدماتك.</li>
+            </ul>
+            <input value={name} onChange={e=>setName(e.target.value)} placeholder="الاسم (اختياري)" className="border rounded-lg px-3 py-2 w-full mb-3" />
+            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={consented} onChange={e=>setConsented(e.target.checked)}/> أوافق على الشروط وسياسة الخصوصية</label>
+            <div className="mt-4 flex gap-3 justify-end">
+              <button onClick={()=>setPhase('cta')} className="border px-4 py-2 rounded-lg">رجوع</button>
+              <button onClick={()=>setPhase('survey')} disabled={!consented} className="bg-black text-white px-4 py-2 rounded-lg disabled:opacity-40">التالي</button>
+            </div>
+          </div>
+        )}
+
+        {phase==='survey' && (
+          <div className="bg-white rounded-2xl shadow-xl p-8">
+            <h2 className="text-xl font-semibold mb-4">الاستبيان القصير</h2>
+            <label className="text-sm block mb-2">عدد الأطراف<input type="number" min={1} value={survey.participants} onChange={e=>setSurvey(s=>({...s,participants:Number(e.target.value)}))} className="border rounded-lg w-full px-3 py-2 mt-1"/></label>
+            <label className="text-sm block mb-2">نوع العلاقة<select value={survey.relation} onChange={e=>setSurvey(s=>({...s,relation:e.target.value}))} className="border rounded-lg w-full px-3 py-2 mt-1"><option>زوجان</option><option>أقارب</option><option>والد وابنه</option><option>أخرى</option></select></label>
+            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={survey.children} onChange={e=>setSurvey(s=>({...s,children:e.target.checked}))}/> هل يوجد أطفال متأثرون بالخلاف؟</label>
+            <div className="mt-4 flex gap-3 justify-end">
+              <button onClick={()=>setPhase('consent')} className="border px-4 py-2 rounded-lg">رجوع</button>
+              <button onClick={startRecording} className="bg-black text-white px-4 py-2 rounded-lg">ابدأ الجلسة</button>
+            </div>
+          </div>
+        )}
+      </div>
+      {phase==='recording' && (<p className="absolute bottom-8 text-gray-300 text-sm">يتم الآن الاستماع (لا يتم حفظ الصوت)</p>)}
+      {phase==='done' && (<p className="absolute bottom-8 text-green-100 text-sm">شكرًا لمساهمتك، تم حفظ النص بأمان.</p>)}
+    </div>
+  );
+}
+```
+
+---
+
+## 🧠 الملاحظات العامة
+
+* الواجهة تعمل من اليمين إلى اليسار بشكل كامل.
+* اللغة الافتراضية: العربية (ar-SA) مع دعم الإنجليزية التلقائي.
+* تُستخدم واجهات Google Speech-to-Text مع خاصية التعرف على المتحدثين.
+* لا يتم حفظ أي تسجيل صوتي؛ فقط النص الناتج في قاعدة البيانات.
+* بعد انتهاء الجلسة بصمت أو مدة محددة، يُخزَّن النص ويُعاد تهيئة الواجهة للزائر التالي.
+
+---
+
+هل ترغب أن أضيف النسخة الخلفية (FastAPI) مع التعليقات بالعربية أيضًا؟

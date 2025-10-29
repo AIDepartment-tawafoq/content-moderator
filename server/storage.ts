@@ -7,6 +7,7 @@ export interface IStorage {
   // Session operations
   createSession(session: InsertSession): Promise<Session>;
   getSession(id: string): Promise<Session | undefined>;
+  getAllSessions(): Promise<Session[]>;
   updateSessionTranscript(id: string, transcript: string): Promise<void>;
   completeSession(id: string): Promise<void>;
 }
@@ -36,6 +37,11 @@ export class DatabaseStorage implements IStorage {
         status: "recording"
       })
       .where(eq(sessions.id, id));
+  }
+
+  async getAllSessions(): Promise<Session[]> {
+    const allSessions = await db.select().from(sessions).orderBy(sessions.createdAt);
+    return allSessions;
   }
 
   async completeSession(id: string): Promise<void> {

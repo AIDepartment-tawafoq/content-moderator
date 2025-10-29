@@ -24,7 +24,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
   // إعداد Google Speech-to-Text client
-  let speechClient: speech.SpeechClient;
+  let speechClient: speech.v1.SpeechClient;
   try {
     const credentials = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
     if (!credentials.type || !credentials.project_id) {
@@ -69,6 +69,116 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.error("Error fetching session:", error);
       res.status(500).json({ 
         error: "خطأ في جلب بيانات الجلسة", 
+        details: error.message 
+      });
+    }
+  });
+
+  // Admin authentication endpoint
+  app.post("/api/admin/login", async (req, res) => {
+    try {
+      const { username, password } = req.body;
+      
+      // Simple admin authentication - credentials from environment for security
+      const adminUsername = process.env.ADMIN_USERNAME || "moslehadmin";
+      const adminPassword = process.env.ADMIN_PASSWORD || "m@2025AtAOt";
+      
+      if (username === adminUsername && password === adminPassword) {
+        // In a real app, you'd create a session/JWT here
+        // For simplicity, we'll just return success
+        res.json({ success: true, message: "تم تسجيل الدخول بنجاح" });
+      } else {
+        res.status(401).json({ success: false, error: "اسم المستخدم أو كلمة المرور غير صحيحة" });
+      }
+    } catch (error: any) {
+      console.error("Error during admin login:", error);
+      res.status(500).json({ error: "خطأ في تسجيل الدخول", details: error.message });
+    }
+  });
+
+  // Admin endpoint: Get all sessions
+  app.get("/api/admin/sessions", async (req, res) => {
+    try {
+      // Simple auth check - in production, you'd verify JWT/session
+      const authHeader = req.headers.authorization;
+      if (!authHeader || authHeader !== "Bearer admin-authenticated") {
+        return res.status(401).json({ error: "غير مصرح" });
+      }
+
+      const sessions = await storage.getAllSessions();
+      res.json(sessions);
+    } catch (error: any) {
+      console.error("Error fetching all sessions:", error);
+      res.status(500).json({ 
+        error: "خطأ في جلب الجلسات", 
+        details: error.message 
+      });
+    }
+  });
+
+  // Admin endpoint: Export sessions as CSV
+  app.get("/api/admin/sessions/export", async (req, res) => {
+    try {
+      // Simple auth check
+      const authHeader = req.headers.authorization;
+      if (!authHeader || authHeader !== "Bearer admin-authenticated") {
+        return res.status(401).json({ error: "غير مصرح" });
+      }
+
+      const sessions = await storage.getAllSessions();
+      
+      // Build CSV content
+      const headers = [
+        "ID",
+        "اسم المشارك",
+        "تاريخ الموافقة",
+        "تاريخ الجلسة",
+        "عدد الأطراف",
+        "نوع العلاقة",
+        "يوجد أطفال متأثرون",
+        "رقم الجلسة",
+        "طبيعة المشكلة",
+        "النص المحول",
+        "الحالة",
+        "تاريخ الاكتمال",
+        "تاريخ الإنشاء"
+      ];
+      
+      const csvRows = [headers.join(",")];
+      
+      sessions.forEach((session) => {
+        const row = [
+          session.id,
+          session.participantName || "",
+          session.consentedAt ? new Date(session.consentedAt).toLocaleString('ar-SA') : "",
+          session.sessionDate ? new Date(session.sessionDate).toLocaleString('ar-SA') : "",
+          session.participantsCount,
+          session.relationType,
+          session.hasAffectedChildren ? "نعم" : "لا",
+          session.sessionNumber,
+          session.problemNature || "",
+          session.transcribedText ? `"${session.transcribedText.replace(/"/g, '""')}"` : "",
+          session.status,
+          session.completedAt ? new Date(session.completedAt).toLocaleString('ar-SA') : "",
+          new Date(session.createdAt).toLocaleString('ar-SA')
+        ];
+        csvRows.push(row.join(","));
+      });
+      
+      const csvContent = csvRows.join("\n");
+      
+      // Set headers for file download
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="sessions-export.csv"');
+      res.setHeader('Content-Length', Buffer.byteLength(csvContent, 'utf8'));
+      
+      // Send BOM for Excel UTF-8 recognition
+      res.write('\uFEFF');
+      res.end(csvContent);
+    } catch (error: any) {
+      console.error("Error exporting sessions:", error);
+      res.status(500).json({ 
+        error: "خطأ في تصدير الجلسات", 
         details: error.message 
       });
     }

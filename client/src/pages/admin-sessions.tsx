@@ -22,32 +22,58 @@ export default function AdminSessions() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
 
   useEffect(() => {
-    const auth = localStorage.getItem("admin-authenticated");
-    if (auth !== "true") {
+    const token = localStorage.getItem("admin-token");
+    if (!token) {
       setLocation("/admin/login");
     } else {
       setIsAuthenticated(true);
     }
   }, [setLocation]);
 
-  const { data: sessions, isLoading } = useQuery<Session[]>({
+  const { data: sessions, isLoading, error } = useQuery<Session[]>({
     queryKey: ["/api/admin/sessions"],
     enabled: isAuthenticated,
     queryFn: async () => {
+      const token = localStorage.getItem("admin-token");
+      if (!token) {
+        throw new Error("لا يوجد رمز مصادقة");
+      }
+      
       const response = await fetch("/api/admin/sessions", {
         headers: {
-          Authorization: "Bearer admin-authenticated",
+          Authorization: `Bearer ${token}`,
         },
       });
+      
+      if (response.status === 401) {
+        // Token expired or invalid - logout
+        localStorage.removeItem("admin-token");
+        setLocation("/admin/login");
+        throw new Error("انتهت صلاحية الجلسة - يرجى تسجيل الدخول مرة أخرى");
+      }
+      
       if (!response.ok) {
         throw new Error("فشل في جلب الجلسات");
       }
+      
       return response.json();
     },
   });
 
+  // Show error if query failed
+  useEffect(() => {
+    if (error) {
+      toast({
+        title: "خطأ",
+        description: error.message,
+        variant: "destructive",
+      });
+    }
+  }, [error, toast]);
+
   const handleLogout = () => {
-    localStorage.removeItem("admin-authenticated");
+    // Clear the secure token
+    localStorage.removeItem("admin-token");
     toast({
       title: "تم تسجيل الخروج بنجاح",
     });
@@ -56,9 +82,20 @@ export default function AdminSessions() {
 
   const handleExportCSV = async () => {
     try {
+      const token = localStorage.getItem("admin-token");
+      if (!token) {
+        toast({
+          title: "خطأ",
+          description: "يرجى تسجيل الدخول مرة أخرى",
+          variant: "destructive",
+        });
+        setLocation("/admin/login");
+        return;
+      }
+      
       const response = await fetch("/api/admin/sessions/export", {
         headers: {
-          Authorization: "Bearer admin-authenticated",
+          Authorization: `Bearer ${token}`,
         },
       });
       

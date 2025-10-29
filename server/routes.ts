@@ -5,6 +5,40 @@ import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
 import { insertSessionSchema } from "@shared/schema";
 import speech from "@google-cloud/speech";
+import crypto from "crypto";
+
+// Simple in-memory session store for admin authentication
+const adminSessions = new Map<string, { createdAt: number }>();
+const SESSION_TIMEOUT = 24 * 60 * 60 * 1000; // 24 hours
+
+// Helper to generate secure random token
+function generateToken(): string {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+// Helper to validate admin token
+function isValidAdminToken(token: string): boolean {
+  const session = adminSessions.get(token);
+  if (!session) return false;
+  
+  // Check if session expired
+  if (Date.now() - session.createdAt > SESSION_TIMEOUT) {
+    adminSessions.delete(token);
+    return false;
+  }
+  
+  return true;
+}
+
+// Clean up expired sessions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of adminSessions.entries()) {
+    if (now - session.createdAt > SESSION_TIMEOUT) {
+      adminSessions.delete(token);
+    }
+  }
+}, 60 * 60 * 1000); // Clean every hour
 
 export async function registerRoutes(app: Express): Promise<Server> {
   const httpServer = createServer(app);
@@ -79,14 +113,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const { username, password } = req.body;
       
-      // Simple admin authentication - credentials from environment for security
-      const adminUsername = process.env.ADMIN_USERNAME || "moslehadmin";
-      const adminPassword = process.env.ADMIN_PASSWORD || "m@2025AtAOt";
+      // Get credentials from environment - REQUIRED for security
+      const adminUsername = process.env.ADMIN_USERNAME;
+      const adminPassword = process.env.ADMIN_PASSWORD;
       
-      if (username === adminUsername && password === adminPassword) {
-        // In a real app, you'd create a session/JWT here
-        // For simplicity, we'll just return success
-        res.json({ success: true, message: "تم تسجيل الدخول بنجاح" });
+      if (!adminUsername || !adminPassword) {
+        console.error("SECURITY WARNING: ADMIN_USERNAME and ADMIN_PASSWORD must be set in environment");
+        // Use default credentials only in development
+        if (process.env.NODE_ENV === "development") {
+          console.warn("Using development default credentials - NOT FOR PRODUCTION");
+        } else {
+          return res.status(500).json({ 
+            error: "خطأ في الإعداد", 
+            details: "Admin credentials not configured" 
+          });
+        }
+      }
+      
+      const validUsername = adminUsername || "moslehadmin";
+      const validPassword = adminPassword || "m@2025AtAOt";
+      
+      if (username === validUsername && password === validPassword) {
+        // Generate a secure random token
+        const token = generateToken();
+        
+        // Store session with timestamp
+        adminSessions.set(token, { createdAt: Date.now() });
+        
+        res.json({ 
+          success: true, 
+          message: "تم تسجيل الدخول بنجاح",
+          token 
+        });
       } else {
         res.status(401).json({ success: false, error: "اسم المستخدم أو كلمة المرور غير صحيحة" });
       }
@@ -99,10 +157,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Admin endpoint: Get all sessions
   app.get("/api/admin/sessions", async (req, res) => {
     try {
-      // Simple auth check - in production, you'd verify JWT/session
+      // Verify admin token
       const authHeader = req.headers.authorization;
-      if (!authHeader || authHeader !== "Bearer admin-authenticated") {
-        return res.status(401).json({ error: "غير مصرح" });
+      const token = authHeader?.replace('Bearer ', '');
+      
+      if (!token || !isValidAdminToken(token)) {
+        return res.status(401).json({ error: "غير مصرح - يرجى تسجيل الدخول مرة أخرى" });
       }
 
       const sessions = await storage.getAllSessions();
@@ -119,10 +179,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Admin endpoint: Export sessions as CSV
   app.get("/api/admin/sessions/export", async (req, res) => {
     try {
-      // Simple auth check
+      // Verify admin token
       const authHeader = req.headers.authorization;
-      if (!authHeader || authHeader !== "Bearer admin-authenticated") {
-        return res.status(401).json({ error: "غير مصرح" });
+      const token = authHeader?.replace('Bearer ', '');
+      
+      if (!token || !isValidAdminToken(token)) {
+        return res.status(401).json({ error: "غير مصرح - يرجى تسجيل الدخول مرة أخرى" });
       }
 
       const sessions = await storage.getAllSessions();

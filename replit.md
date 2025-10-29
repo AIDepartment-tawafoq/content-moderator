@@ -15,6 +15,35 @@ The application emphasizes trust, privacy, and cultural sensitivity with a calm,
 
 ## التحديثات الأخيرة | Recent Changes (October 29, 2025)
 
+### 🆕 لوحة الإدارة | Admin Panel (NEW)
+
+تم إضافة لوحة إدارة آمنة لعرض وتصدير الجلسات:
+
+**المميزات**:
+- 🔐 نظام مصادقة آمن بـ tokens عشوائية (24 ساعة صلاحية)
+- 📊 عرض جميع الجلسات في جدول منظم
+- 📥 تصدير CSV لجميع البيانات (مع دعم UTF-8 للعربية)
+- 🚪 تسجيل دخول/خروج آمن
+
+**المسارات**:
+- `/admin/login` - صفحة تسجيل الدخول
+- `/admin/sessions` - عرض الجلسات (يتطلب تسجيل دخول)
+
+**بيانات الاعتماد الافتراضية** (development فقط):
+- اسم المستخدم: `moslehadmin`
+- كلمة المرور: `m@2025AtAOt`
+
+**⚠️ مهم للإنتاج**:
+يجب تعيين `ADMIN_USERNAME` و `ADMIN_PASSWORD` في environment variables
+
+**الأمان**:
+- Tokens عشوائية آمنة (crypto.randomBytes)
+- Session management على الخادم
+- Token expiration بعد 24 ساعة
+- تنظيف تلقائي للـ sessions منتهية الصلاحية
+
+---
+
 ### ✅ التحسينات المنجزة | Completed Improvements
 
 1. **معالجة الصوت المحسنة | Enhanced Audio Processing**
@@ -184,11 +213,14 @@ The application emphasizes trust, privacy, and cultural sensitivity with a calm,
 
 ### Frontend
 - `client/src/pages/home.tsx` - المكون الرئيسي لجميع المراحل
+- `client/src/pages/privacy-policy.tsx` - صفحة سياسة الخصوصية
+- `client/src/pages/admin-login.tsx` - صفحة تسجيل دخول الإدارة
+- `client/src/pages/admin-sessions.tsx` - صفحة عرض الجلسات للإدارة
 - `client/public/audio-processor.js` - AudioWorklet لمعالجة الصوت
 - `client/src/lib/queryClient.ts` - إعداد TanStack Query
 
 ### Backend
-- `server/routes.ts` - API endpoints + WebSocket handler
+- `server/routes.ts` - API endpoints + WebSocket handler + Admin endpoints
 - `server/storage.ts` - Database operations interface
 - `server/db.ts` - Drizzle ORM configuration
 

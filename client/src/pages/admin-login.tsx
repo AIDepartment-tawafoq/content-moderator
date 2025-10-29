@@ -29,9 +29,9 @@ export default function AdminLogin() {
 
       const data = await response.json();
 
-      if (response.ok && data.success) {
-        // Store authentication in localStorage (simple approach)
-        localStorage.setItem("admin-authenticated", "true");
+      if (response.ok && data.success && data.token) {
+        // Store the secure token received from server
+        localStorage.setItem("admin-token", data.token);
         toast({
           title: "تم تسجيل الدخول بنجاح",
           description: "مرحباً بك في لوحة الإدارة",

@@ -20,10 +20,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Mic, Shield, Check, ChevronRight, AlertCircle, X } from "lucide-react";
+import { Mic, Shield, Check, ChevronRight, AlertCircle, X, Pause, Play } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest } from "@/lib/queryClient";
+import { Link } from "wouter";
+import logoImage from "@assets/logo-tawafoq_1761731886969.png";
 
 type Phase = "cta" | "consent" | "survey" | "recording" | "done";
 
@@ -41,12 +44,15 @@ const surveyFormSchema = z.object({
   participantsCount: z.number().min(1, "يجب أن يكون العدد 1 على الأقل").max(10, "الحد الأقصى 10 أطراف"),
   relationType: z.enum(["زوجان", "أقارب", "والد وابنه", "أخرى"]),
   hasAffectedChildren: z.boolean(),
+  sessionNumber: z.enum(["الأولى", "الثانية", "الثالثة", "أكثر من ثلاث"]),
+  problemNature: z.enum(["خلافات زوجية", "خلافات أسرية", "خلافات مالية", "خلافات على الحضانة", "خلافات أخرى"]).optional(),
 });
 
 export default function Home() {
   const [phase, setPhase] = useState<Phase>("cta");
   const [isDimmed, setIsDimmed] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
   const [recordingStatus, setRecordingStatus] = useState("");
   const [currentTranscript, setCurrentTranscript] = useState("");
   const [error, setError] = useState<string>("");
@@ -77,6 +83,8 @@ export default function Home() {
       participantsCount: 2,
       relationType: "زوجان",
       hasAffectedChildren: false,
+      sessionNumber: "الأولى",
+      problemNature: undefined,
     },
   });
 
@@ -101,6 +109,8 @@ export default function Home() {
           participantsCount: data.participantsCount,
           relationType: data.relationType,
           hasAffectedChildren: data.hasAffectedChildren,
+          sessionNumber: data.sessionNumber,
+          problemNature: data.problemNature,
         }
       );
 
@@ -161,8 +171,8 @@ export default function Home() {
 
           // Handle audio data from worklet
           workletNode.port.onmessage = (event) => {
-            if (ws.readyState === WebSocket.OPEN) {
-              // Send raw PCM16 buffer to server
+            if (ws.readyState === WebSocket.OPEN && !isPaused) {
+              // Send raw PCM16 buffer to server only if not paused
               ws.send(event.data);
             }
           };
@@ -179,7 +189,7 @@ export default function Home() {
           const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
 
           processor.onaudioprocess = (e) => {
-            if (ws.readyState === WebSocket.OPEN) {
+            if (ws.readyState === WebSocket.OPEN && !isPaused) {
               const inputData = e.inputBuffer.getChannelData(0);
               
               // Simple downsampling: take every nth sample
@@ -288,14 +298,25 @@ export default function Home() {
     }, 5000);
   };
 
-  // Cancel recording (user-initiated)
-  const cancelRecording = () => {
-    stopRecording();
-    setPhase("survey");
-    toast({
-      title: "تم الإلغاء",
-      description: "تم إلغاء الجلسة بنجاح",
-    });
+  // Toggle pause/resume recording
+  const togglePauseRecording = () => {
+    if (isPaused) {
+      // Resume
+      setIsPaused(false);
+      setRecordingStatus("يتم الآن الاستماع (لا يتم حفظ الصوت)");
+      toast({
+        title: "تم استئناف التسجيل",
+        description: "التسجيل قيد العمل الآن",
+      });
+    } else {
+      // Pause
+      setIsPaused(true);
+      setRecordingStatus("التسجيل متوقف مؤقتاً");
+      toast({
+        title: "تم إيقاف التسجيل مؤقتاً",
+        description: "يمكنك استئناف التسجيل في أي وقت",
+      });
+    }
   };
 
   // Reset session for next user
@@ -316,6 +337,8 @@ export default function Home() {
       participantsCount: 2,
       relationType: "زوجان",
       hasAffectedChildren: false,
+      sessionNumber: "الأولى",
+      problemNature: undefined,
     });
   };
 
@@ -350,7 +373,17 @@ export default function Home() {
         {/* Phase 1: Call-to-Action */}
         {phase === "cta" && (
           <Card className="shadow-xl" data-testid="card-cta">
-            <CardHeader className="space-y-2 p-6 md:p-8">
+            <CardHeader className="space-y-4 p-6 md:p-8">
+              {/* Logo */}
+              <div className="flex justify-center mb-2">
+                <img 
+                  src={logoImage} 
+                  alt="شعار التوافق" 
+                  className="h-16 w-auto object-contain"
+                  data-testid="img-logo"
+                />
+              </div>
+              
               <div className="flex items-start gap-3">
                 <div className="rounded-full bg-primary/10 p-3">
                   <Shield className="w-6 h-6 text-primary" />
@@ -419,6 +452,19 @@ export default function Home() {
                       </FormItem>
                     )}
                   />
+
+                  {/* Privacy Policy Link */}
+                  <div className="p-4 rounded-lg bg-muted/30 border">
+                    <p className="text-sm leading-relaxed font-arabic mb-2">
+                      قبل الموافقة، يرجى قراءة{" "}
+                      <Link href="/privacy-policy">
+                        <a className="text-primary hover:underline font-semibold" data-testid="link-privacy-policy">
+                          سياسة الخصوصية وحماية البيانات
+                        </a>
+                      </Link>
+                      {" "}للتعرف على كيفية معالجة بياناتك وفقاً لنظام حماية البيانات الشخصية (PDPL).
+                    </p>
+                  </div>
 
                   {/* Consent checkbox */}
                   <FormField
@@ -585,6 +631,63 @@ export default function Home() {
                     )}
                   />
 
+                  {/* Session number */}
+                  <FormField
+                    control={surveyForm.control}
+                    name="sessionNumber"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="font-arabic">رقم الجلسة</FormLabel>
+                        <Select onValueChange={field.onChange} defaultValue={field.value}>
+                          <FormControl>
+                            <SelectTrigger
+                              className="h-11 font-arabic"
+                              data-testid="select-session-number"
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent className="font-arabic">
+                            <SelectItem value="الأولى">الأولى</SelectItem>
+                            <SelectItem value="الثانية">الثانية</SelectItem>
+                            <SelectItem value="الثالثة">الثالثة</SelectItem>
+                            <SelectItem value="أكثر من ثلاث">أكثر من ثلاث</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <FormMessage className="font-arabic" />
+                      </FormItem>
+                    )}
+                  />
+
+                  {/* Problem nature (optional) */}
+                  <FormField
+                    control={surveyForm.control}
+                    name="problemNature"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="font-arabic">طبيعة المشكلة (اختياري)</FormLabel>
+                        <Select onValueChange={field.onChange} value={field.value}>
+                          <FormControl>
+                            <SelectTrigger
+                              className="h-11 font-arabic"
+                              data-testid="select-problem-nature"
+                            >
+                              <SelectValue placeholder="اختر طبيعة المشكلة" />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent className="font-arabic">
+                            <SelectItem value="خلافات زوجية">خلافات زوجية</SelectItem>
+                            <SelectItem value="خلافات أسرية">خلافات أسرية</SelectItem>
+                            <SelectItem value="خلافات مالية">خلافات مالية</SelectItem>
+                            <SelectItem value="خلافات على الحضانة">خلافات على الحضانة</SelectItem>
+                            <SelectItem value="خلافات أخرى">خلافات أخرى</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <FormMessage className="font-arabic" />
+                      </FormItem>
+                    )}
+                  />
+
                   {/* Navigation buttons */}
                   <div className="flex gap-3 justify-end pt-2">
                     <Button
@@ -630,16 +733,25 @@ export default function Home() {
                 <p className="text-sm text-gray-300 font-arabic" data-testid="text-recording-status">
                   {recordingStatus}
                 </p>
-                {/* Cancel button */}
+                {/* Pause/Resume button */}
                 <div className="pt-4 pointer-events-auto">
                   <Button
                     variant="outline"
-                    onClick={cancelRecording}
+                    onClick={togglePauseRecording}
                     className="bg-white/10 hover:bg-white/20 text-white border-white/30 font-arabic"
-                    data-testid="button-cancel-recording"
+                    data-testid="button-toggle-recording"
                   >
-                    <X className="w-4 h-4 ml-2" />
-                    إلغاء الجلسة
+                    {isPaused ? (
+                      <>
+                        <Play className="w-4 h-4 ml-2" />
+                        استئناف التسجيل
+                      </>
+                    ) : (
+                      <>
+                        <Pause className="w-4 h-4 ml-2" />
+                        وقف التسجيل
+                      </>
+                    )}
                   </Button>
                 </div>
               </>

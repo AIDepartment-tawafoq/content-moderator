@@ -719,39 +719,72 @@ export default function Home() {
       {(phase === "recording" || phase === "done") && (
         <div className="fixed inset-0 flex flex-col items-center justify-center gap-8 pointer-events-none">
           <div
-            className={`text-center space-y-3 transition-opacity duration-700 ${
+            className={`text-center space-y-6 transition-opacity duration-700 ${
               phase === "recording" ? "opacity-100" : "opacity-0"
             }`}
           >
             {isRecording && (
               <>
-                <div className="flex justify-center">
-                  <div className="rounded-full bg-red-500/20 p-4 animate-pulse-slow">
-                    <Mic className="w-8 h-8 text-red-400" data-testid="icon-recording" />
+                {/* Calm status indicator - no pulsing icon */}
+                <div className="flex flex-col items-center gap-4">
+                  {/* Gentle animated dots */}
+                  <div className="flex gap-2" data-testid="recording-indicator">
+                    <div className="w-3 h-3 rounded-full bg-teal-400/60 animate-bounce-slow"></div>
+                    <div className="w-3 h-3 rounded-full bg-teal-400/60 animate-bounce-slow" style={{ animationDelay: '0.2s' }}></div>
+                    <div className="w-3 h-3 rounded-full bg-teal-400/60 animate-bounce-slow" style={{ animationDelay: '0.4s' }}></div>
                   </div>
+                  
+                  {/* Reassuring message */}
+                  <div className="space-y-2">
+                    <p className="text-xl text-teal-100 font-arabic font-semibold" data-testid="text-session-status">
+                      {isPaused ? "الجلسة متوقفة مؤقتاً" : "جلستكم محمية وآمنة"}
+                    </p>
+                    <p className="text-sm text-gray-300 font-arabic" data-testid="text-recording-status">
+                      {isPaused ? "يمكنك استئناف الجلسة في أي وقت" : "يتم تحويل الكلام إلى نص فقط - لا يتم حفظ الصوت"}
+                    </p>
+                  </div>
+
+                  {/* Info about automatic completion */}
+                  {!isPaused && (
+                    <div className="px-4 py-2 bg-white/5 rounded-lg border border-white/10">
+                      <p className="text-xs text-gray-400 font-arabic">
+                        ستنتهي الجلسة تلقائياً بعد 5 دقائق من الصمت
+                      </p>
+                    </div>
+                  )}
                 </div>
-                <p className="text-sm text-gray-300 font-arabic" data-testid="text-recording-status">
-                  {recordingStatus}
-                </p>
-                {/* Pause/Resume button */}
-                <div className="pt-4 pointer-events-auto">
+
+                {/* Control buttons */}
+                <div className="flex gap-3 pointer-events-auto">
+                  {/* Pause/Resume button */}
                   <Button
                     variant="outline"
                     onClick={togglePauseRecording}
-                    className="bg-white/10 hover:bg-white/20 text-white border-white/30 font-arabic"
+                    className="bg-white/10 hover:bg-white/20 text-white border-white/30 font-arabic px-6"
                     data-testid="button-toggle-recording"
                   >
                     {isPaused ? (
                       <>
                         <Play className="w-4 h-4 ml-2" />
-                        استئناف التسجيل
+                        استئناف الجلسة
                       </>
                     ) : (
                       <>
                         <Pause className="w-4 h-4 ml-2" />
-                        وقف التسجيل
+                        إيقاف مؤقت
                       </>
                     )}
+                  </Button>
+
+                  {/* Finish session button */}
+                  <Button
+                    variant="outline"
+                    onClick={stopRecording}
+                    className="bg-green-500/20 hover:bg-green-500/30 text-green-100 border-green-400/30 font-arabic px-6"
+                    data-testid="button-finish-session"
+                  >
+                    <Check className="w-4 h-4 ml-2" />
+                    إنهاء الجلسة
                   </Button>
                 </div>
               </>

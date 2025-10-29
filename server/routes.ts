@@ -89,10 +89,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
     let accumulatedTranscript = '';
     let recognizeStream: any = null;
     let silenceTimer: NodeJS.Timeout | null = null;
-    const SILENCE_TIMEOUT = 20000; // 20 ثانية من الصمت
+    const SILENCE_TIMEOUT = 300000; // 5 دقائق من الصمت (300 ثانية)
 
-    // إنشاء streaming recognition request
-    // Using LINEAR16 PCM at 16kHz from ScriptProcessorNode
+    // إنشاء streaming recognition request مع speaker diarization
+    // Using LINEAR16 PCM at 16kHz from AudioWorklet
     const request = {
       config: {
         encoding: 'LINEAR16' as const,
@@ -101,6 +101,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
         alternativeLanguageCodes: ['ar-AE', 'ar-EG'], // لهجات عربية أخرى
         enableAutomaticPunctuation: true,
         model: 'default',
+        diarizationConfig: {
+          enableSpeakerDiarization: true,
+          minSpeakerCount: 2,
+          maxSpeakerCount: 4,
+        },
       },
       interimResults: true,
     };
@@ -195,9 +200,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
     ws.on('message', (message: Buffer) => {
       if (recognizeStream && !recognizeStream.destroyed) {
         try {
-          // تحويل البيانات إلى التنسيق الصحيح لـ Google Speech-to-Text
-          // The streaming API expects audio chunks wrapped in an object
-          recognizeStream.write({ audioContent: Buffer.from(message) });
+          // إرسال audio chunks فقط (config تم إرساله مسبقاً عند إنشاء الـ stream)
+          // Google Speech API expects raw audio buffer after initial config
+          recognizeStream.write(message);
           
           // إعادة تعيين مؤقت الصمت عند استقبال صوت
           resetSilenceTimer();

@@ -32,15 +32,15 @@
 
   --sidebar-border: 210 6% 86%;
 
-  --sidebar-primary: 210 85% 28%;
+  --sidebar-primary: 36 91% 45%;
 
-  --sidebar-primary-foreground: 210 85% 98%;
+  --sidebar-primary-foreground: 36 91% 98%;
 
-  --sidebar-accent: 210 8% 88%;
+  --sidebar-accent: 186 70% 88%;
 
-  --sidebar-accent-foreground: 210 8% 18%;
+  --sidebar-accent-foreground: 186 70% 18%;
 
-  --sidebar-ring: 210 85% 28%;
+  --sidebar-ring: 36 91% 45%;
 
   --popover: 210 6% 92%;
 
@@ -48,21 +48,21 @@
 
   --popover-border: 210 6% 84%;
 
-  --primary: 210 85% 28%;
+  --primary: 36 91% 45%;
 
-  --primary-foreground: 210 85% 98%;
+  --primary-foreground: 36 91% 98%;
 
-  --secondary: 210 8% 86%;
+  --secondary: 186 70% 38%;
 
-  --secondary-foreground: 210 8% 20%;
+  --secondary-foreground: 186 70% 98%;
 
   --muted: 210 10% 90%;
 
   --muted-foreground: 210 10% 28%;
 
-  --accent: 210 12% 88%;
+  --accent: 186 70% 88%;
 
-  --accent-foreground: 210 12% 22%;
+  --accent-foreground: 186 70% 22%;
 
   --destructive: 0 72% 32%;
 
@@ -150,15 +150,15 @@
 
   --sidebar-border: 210 5% 16%;
 
-  --sidebar-primary: 210 85% 28%;
+  --sidebar-primary: 36 91% 50%;
 
-  --sidebar-primary-foreground: 210 85% 98%;
+  --sidebar-primary-foreground: 36 91% 98%;
 
-  --sidebar-accent: 210 6% 16%;
+  --sidebar-accent: 186 70% 20%;
 
-  --sidebar-accent-foreground: 210 6% 86%;
+  --sidebar-accent-foreground: 186 70% 88%;
 
-  --sidebar-ring: 210 85% 28%;
+  --sidebar-ring: 36 91% 50%;
 
   --popover: 210 5% 14%;
 
@@ -166,21 +166,21 @@
 
   --popover-border: 210 5% 20%;
 
-  --primary: 210 85% 28%;
+  --primary: 36 91% 50%;
 
-  --primary-foreground: 210 85% 98%;
+  --primary-foreground: 36 91% 98%;
 
-  --secondary: 210 6% 18%;
+  --secondary: 186 70% 42%;
 
-  --secondary-foreground: 210 6% 88%;
+  --secondary-foreground: 186 70% 98%;
 
   --muted: 210 8% 16%;
 
   --muted-foreground: 210 8% 76%;
 
-  --accent: 210 10% 18%;
+  --accent: 186 70% 24%;
 
-  --accent-foreground: 210 10% 84%;
+  --accent-foreground: 186 70% 88%;
 
   --destructive: 0 72% 32%;
 

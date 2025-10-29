@@ -15,6 +15,8 @@ export const sessions = pgTable("sessions", {
   participantsCount: integer("participants_count").notNull(),
   relationType: text("relation_type").notNull(), // زوجان، أقارب، والد وابنه، أخرى
   hasAffectedChildren: boolean("has_affected_children").notNull().default(false),
+  sessionNumber: text("session_number").notNull(), // الأولى، الثانية، الثالثة، أكثر من ثلاث
+  problemNature: text("problem_nature"), // طبيعة المشكلة - اختياري
   
   // النص المحول - لا يتم حفظ أي تسجيل صوتي
   transcribedText: text("transcribed_text"),
@@ -39,6 +41,8 @@ export const insertSessionSchema = createInsertSchema(sessions).omit({
   participantsCount: z.number().min(1).max(10),
   relationType: z.enum(["زوجان", "أقارب", "والد وابنه", "أخرى"]),
   hasAffectedChildren: z.boolean(),
+  sessionNumber: z.enum(["الأولى", "الثانية", "الثالثة", "أكثر من ثلاث"]),
+  problemNature: z.enum(["خلافات زوجية", "خلافات أسرية", "خلافات مالية", "خلافات على الحضانة", "خلافات أخرى"]).optional(),
 });
 
 export type InsertSession = z.infer<typeof insertSessionSchema>;

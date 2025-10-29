@@ -704,7 +704,6 @@ export default function Home() {
                       className="px-6 font-arabic hover-elevate active-elevate-2"
                       data-testid="button-start-recording"
                     >
-                      <Mic className="w-4 h-4 ml-2" />
                       ابدأ الجلسة
                     </Button>
                   </div>

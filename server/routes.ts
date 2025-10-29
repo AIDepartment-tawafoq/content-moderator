@@ -33,11 +33,11 @@ function isValidAdminToken(token: string): boolean {
 // Clean up expired sessions periodically
 setInterval(() => {
   const now = Date.now();
-  for (const [token, session] of adminSessions.entries()) {
+  Array.from(adminSessions.entries()).forEach(([token, session]) => {
     if (now - session.createdAt > SESSION_TIMEOUT) {
       adminSessions.delete(token);
     }
-  }
+  });
 }, 60 * 60 * 1000); // Clean every hour
 
 export async function registerRoutes(app: Express): Promise<Server> {
@@ -58,7 +58,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
   // إعداد Google Speech-to-Text client
-  let speechClient: speech.v1.SpeechClient;
+  let speechClient: any;
   try {
     const credentials = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
     if (!credentials.type || !credentials.project_id) {

@@ -12,6 +12,26 @@
 - Progressive disclosure of information
 - Privacy signals throughout the experience
 
+## Brand Colors (Updated October 2025)
+
+Based on the official logo, the color scheme features warm and trustworthy tones:
+
+**Primary Color (Orange):** #E88F3A / HSL(36, 91%, 45-50%)
+- Represents warmth, trust, and approachability
+- Used for primary actions, headings, and brand elements
+- Conveys cultural warmth while maintaining professional authority
+
+**Secondary/Accent Color (Teal):** #1B9AAA / HSL(186, 70%, 38-42%)
+- Represents calmness, reliability, and professionalism
+- Used for secondary actions and accents
+- Provides visual balance to the warm orange primary
+
+**Application:**
+- Logo displayed in CTA phase header (h-16)
+- Primary buttons use orange with high contrast
+- Accent elements use teal for balance
+- Maintains accessibility with proper contrast ratios
+
 ---
 
 ## Typography System

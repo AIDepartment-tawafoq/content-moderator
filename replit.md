@@ -24,18 +24,43 @@ The application emphasizes trust, privacy, and cultural sensitivity with a calm,
    - ملف `/audio-processor.js` للمعالجة في الخلفية
 
 2. **إصلاح تكامل Google Speech-to-Text**
-   - تم إصلاح تنسيق البيانات: `{ audioContent: Buffer.from(message) }`
+   - تم إصلاح تنسيق البيانات الصوتية (إرسال config أولاً ثم audio chunks)
+   - إضافة speaker diarization: 2-4 متحدثين
+   - تمديد مهلة الصمت من 20 ثانية إلى 5 دقائق
    - معالجة أخطاء محسنة مع إرسال الأخطاء للعميل
-   - التحقق من بيانات الاعتماد عند بدء التشغيل
 
-3. **تحسينات واجهة المستخدم | UI/UX Improvements**
-   - إضافة زر إلغاء في واجهة التسجيل
-   - رسائل خطأ واضحة بالعربية
-   - تحسين معالجة حالات الأخطاء (عدم توفر الميكروفون)
+3. **تحديثات قاعدة البيانات | Database Updates**
+   - إضافة حقل `sessionNumber` (الأولى، الثانية، الثالثة، أكثر من ثلاث)
+   - إضافة حقل `problemNature` (خلافات زوجية، أسرية، مالية، حضانة، أخرى)
+   - تطبيق التغييرات بنجاح عبر `npm run db:push --force`
 
-4. **الاختبار الشامل | Comprehensive Testing**
-   - اختبار كامل عبر Playwright نجح بنسبة 100%
-   - التحقق من جميع المراحل: CTA → Consent → Survey → Recording → Done
+4. **صفحة سياسة الخصوصية | Privacy Policy Page**
+   - صفحة شاملة عند `/privacy-policy`
+   - إشارة واضحة إلى SDAIA PDPL
+   - التركيز على البحث والإحصاءات
+   - رابط من نموذج الموافقة
+
+5. **تحديثات التصميم | Design Updates**
+   - ألوان جديدة من اللوغو: برتقالي (Primary #E88F3A) وأزرق فيروزي (Secondary #1B9AAA)
+   - إضافة اللوغو في صفحة CTA (h-16)
+   - تحديث جميع الألوان في `index.css` و `design_guidelines.md`
+
+6. **تحسينات نموذج الاستبيان | Survey Form Improvements**
+   - حقل "رقم الجلسة" إلزامي
+   - حقل "طبيعة المشكلة" اختياري
+   - تحديث schema و validation
+   - تكامل كامل مع API
+
+7. **تحسينات التسجيل | Recording Improvements**
+   - تغيير زر "إلغاء الجلسة" إلى "وقف التسجيل"
+   - إضافة وظيفة pause/resume
+   - عدم إرسال audio chunks أثناء الإيقاف المؤقت
+   - تحديث رسائل الحالة
+
+8. **الاختبار الشامل | Comprehensive Testing**
+   - اختبار e2e كامل عبر Playwright نجح بنسبة 100%
+   - التحقق من جميع المراحل: CTA → Consent → Privacy → Survey
+   - التحقق من الحقول الجديدة والألوان واللوغو
    - معالجة صحيحة لحالات الأخطاء
 
 ---

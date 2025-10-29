@@ -11,7 +11,7 @@ export default {
         sm: ".1875rem", /* 3px */
       },
       colors: {
-        // Flat / base colors (regular buttons)
+        // نظام ألوان هادئ ومريح للمنصة العربية
         background: "hsl(var(--background) / <alpha-value>)",
         foreground: "hsl(var(--foreground) / <alpha-value>)",
         border: "hsl(var(--border) / <alpha-value>)",
@@ -86,6 +86,9 @@ export default {
         sans: ["var(--font-sans)"],
         serif: ["var(--font-serif)"],
         mono: ["var(--font-mono)"],
+        // خطوط عربية
+        arabic: ["IBM Plex Sans Arabic", "Cairo", "system-ui", "sans-serif"],
+        "arabic-display": ["Tajawal", "Cairo", "system-ui", "sans-serif"],
       },
       keyframes: {
         "accordion-down": {
@@ -96,10 +99,15 @@ export default {
           from: { height: "var(--radix-accordion-content-height)" },
           to: { height: "0" },
         },
+        "pulse-slow": {
+          "0%, 100%": { opacity: "1" },
+          "50%": { opacity: "0.5" },
+        },
       },
       animation: {
         "accordion-down": "accordion-down 0.2s ease-out",
         "accordion-up": "accordion-up 0.2s ease-out",
+        "pulse-slow": "pulse-slow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite",
       },
     },
   },

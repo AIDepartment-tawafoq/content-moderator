@@ -298,11 +298,43 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .on('data', async (data: any) => {
           const result = data.results[0];
           if (result && result.alternatives[0]) {
-            const transcript = result.alternatives[0].transcript;
+            let transcript = result.alternatives[0].transcript;
+            
+            // استخراج معلومات المتحدثين من diarization
+            if (result.isFinal && result.alternatives[0].words && result.alternatives[0].words.length > 0) {
+              // تجميع الكلمات حسب المتحدث
+              const words = result.alternatives[0].words;
+              let formattedTranscript = '';
+              let currentSpeaker = -1;
+              let currentText = '';
+              
+              for (const wordInfo of words) {
+                const speakerTag = wordInfo.speakerTag || 0;
+                
+                if (currentSpeaker !== speakerTag && currentSpeaker !== -1) {
+                  // تغير المتحدث - حفظ النص السابق
+                  formattedTranscript += `[المتحدث ${currentSpeaker}]: ${currentText.trim()}\n`;
+                  currentText = '';
+                }
+                
+                currentSpeaker = speakerTag;
+                currentText += wordInfo.word + ' ';
+              }
+              
+              // إضافة آخر جزء
+              if (currentText.trim()) {
+                formattedTranscript += `[المتحدث ${currentSpeaker}]: ${currentText.trim()}\n`;
+              }
+              
+              // استخدام النص المنسق إذا كان متوفراً
+              if (formattedTranscript) {
+                transcript = formattedTranscript;
+              }
+            }
             
             if (result.isFinal) {
               // نص نهائي - إضافته للنص المتراكم
-              accumulatedTranscript += transcript + ' ';
+              accumulatedTranscript += transcript;
               
               // حفظ في قاعدة البيانات
               try {

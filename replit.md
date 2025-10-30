@@ -54,9 +54,10 @@ The application emphasizes trust, privacy, and cultural sensitivity with a calm,
 
 2. **إصلاح تكامل Google Speech-to-Text**
    - تم إصلاح تنسيق البيانات الصوتية (إرسال config أولاً ثم audio chunks)
-   - إضافة speaker diarization: 2-4 متحدثين
+   - تحويل الكلام إلى نص بجودة عالية للغة العربية (ar-SA, ar-AE, ar-EG)
    - تمديد مهلة الصمت من 20 ثانية إلى 5 دقائق
    - معالجة أخطاء محسنة مع إرسال الأخطاء للعميل
+   - إضافة علامات ترقيم تلقائية للنص المحول
 
 3. **تحديثات قاعدة البيانات | Database Updates**
    - إضافة حقل `sessionNumber` (الأولى، الثانية، الثالثة، أكثر من ثلاث)

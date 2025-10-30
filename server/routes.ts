@@ -263,7 +263,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     let silenceTimer: NodeJS.Timeout | null = null;
     const SILENCE_TIMEOUT = 300000; // 5 دقائق من الصمت (300 ثانية)
 
-    // إنشاء streaming recognition request مع speaker diarization
+    // إنشاء streaming recognition request للتحويل الصوتي
     // Using LINEAR16 PCM at 16kHz from AudioWorklet
     const request = {
       config: {
@@ -272,13 +272,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         languageCode: 'ar-SA', // اللغة العربية - السعودية
         alternativeLanguageCodes: ['ar-AE', 'ar-EG'], // لهجات عربية أخرى
         enableAutomaticPunctuation: true,
-        enableWordTimeOffsets: true, // مطلوب للحصول على speaker tags
         model: 'default',
-        diarizationConfig: {
-          enableSpeakerDiarization: true,
-          minSpeakerCount: 2,
-          maxSpeakerCount: 4,
-        },
       },
       interimResults: true,
     };
@@ -299,65 +293,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .on('data', async (data: any) => {
           const result = data.results[0];
           if (result && result.alternatives[0]) {
-            let transcript = result.alternatives[0].transcript;
-            
-            // Log for debugging
-            console.log(`[DEBUG] isFinal: ${result.isFinal}, hasWords: ${!!result.alternatives[0].words}, wordsCount: ${result.alternatives[0].words?.length || 0}`);
-            
-            // استخراج معلومات المتحدثين من diarization
-            if (result.isFinal && result.alternatives[0].words && result.alternatives[0].words.length > 0) {
-              const words = result.alternatives[0].words;
-              console.log(`[DIARIZATION] Processing ${words.length} words`);
-              
-              // Log first few words with speaker tags
-              words.slice(0, 3).forEach((w: any, i: number) => {
-                console.log(`  Word ${i}: "${w.word}" - Speaker: ${w.speakerTag || 'NO TAG'}`);
-              });
-              
-              // تجميع الكلمات حسب المتحدث
-              let formattedTranscript = '';
-              let currentSpeaker = -1;
-              let currentText = '';
-              
-              for (const wordInfo of words) {
-                const speakerTag = wordInfo.speakerTag || 0;
-                
-                if (currentSpeaker !== speakerTag && currentSpeaker !== -1) {
-                  // تغير المتحدث - حفظ النص السابق
-                  formattedTranscript += `[المتحدث ${currentSpeaker}]: ${currentText.trim()}\n`;
-                  currentText = '';
-                }
-                
-                currentSpeaker = speakerTag;
-                currentText += wordInfo.word + ' ';
-              }
-              
-              // إضافة آخر جزء
-              if (currentText.trim()) {
-                formattedTranscript += `[المتحدث ${currentSpeaker}]: ${currentText.trim()}\n`;
-              }
-              
-              console.log(`[DIARIZATION] Formatted transcript:\n${formattedTranscript}`);
-              
-              // استخدام النص المنسق إذا كان متوفراً
-              if (formattedTranscript) {
-                transcript = formattedTranscript;
-              }
-            }
+            const transcript = result.alternatives[0].transcript;
             
             if (result.isFinal) {
               // نص نهائي - استبدال النص المتراكم بالكامل
               // ملاحظة: Google يرسل النص الكامل في كل مرة، ليس فقط الجزء الجديد
               accumulatedTranscript = transcript;
               
-              console.log(`[SAVE] Saving to DB - Session ${sessionId}, Length: ${accumulatedTranscript.length}`);
-              
               // حفظ في قاعدة البيانات
               try {
                 await storage.updateSessionTranscript(sessionId, accumulatedTranscript);
-                console.log(`[SUCCESS] Transcript saved successfully`);
+                console.log(`Transcript saved for session ${sessionId}`);
               } catch (error) {
-                console.error('[ERROR] Error updating transcript:', error);
+                console.error('Error updating transcript:', error);
               }
 
               // إرسال للعميل

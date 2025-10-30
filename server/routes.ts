@@ -272,6 +272,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         languageCode: 'ar-SA', // اللغة العربية - السعودية
         alternativeLanguageCodes: ['ar-AE', 'ar-EG'], // لهجات عربية أخرى
         enableAutomaticPunctuation: true,
+        enableWordTimeOffsets: true, // مطلوب للحصول على speaker tags
         model: 'default',
         diarizationConfig: {
           enableSpeakerDiarization: true,
@@ -300,10 +301,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
           if (result && result.alternatives[0]) {
             let transcript = result.alternatives[0].transcript;
             
+            // Log for debugging
+            console.log(`[DEBUG] isFinal: ${result.isFinal}, hasWords: ${!!result.alternatives[0].words}, wordsCount: ${result.alternatives[0].words?.length || 0}`);
+            
             // استخراج معلومات المتحدثين من diarization
             if (result.isFinal && result.alternatives[0].words && result.alternatives[0].words.length > 0) {
-              // تجميع الكلمات حسب المتحدث
               const words = result.alternatives[0].words;
+              console.log(`[DIARIZATION] Processing ${words.length} words`);
+              
+              // Log first few words with speaker tags
+              words.slice(0, 3).forEach((w: any, i: number) => {
+                console.log(`  Word ${i}: "${w.word}" - Speaker: ${w.speakerTag || 'NO TAG'}`);
+              });
+              
+              // تجميع الكلمات حسب المتحدث
               let formattedTranscript = '';
               let currentSpeaker = -1;
               let currentText = '';
@@ -326,6 +337,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 formattedTranscript += `[المتحدث ${currentSpeaker}]: ${currentText.trim()}\n`;
               }
               
+              console.log(`[DIARIZATION] Formatted transcript:\n${formattedTranscript}`);
+              
               // استخدام النص المنسق إذا كان متوفراً
               if (formattedTranscript) {
                 transcript = formattedTranscript;
@@ -336,12 +349,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
               // نص نهائي - إضافته للنص المتراكم
               accumulatedTranscript += transcript;
               
+              console.log(`[SAVE] Saving to DB - Session ${sessionId}, Length: ${accumulatedTranscript.length}`);
+              
               // حفظ في قاعدة البيانات
               try {
                 await storage.updateSessionTranscript(sessionId, accumulatedTranscript);
-                console.log(`Transcript updated for session ${sessionId}: "${transcript}"`);
+                console.log(`[SUCCESS] Transcript saved successfully`);
               } catch (error) {
-                console.error('Error updating transcript:', error);
+                console.error('[ERROR] Error updating transcript:', error);
               }
 
               // إرسال للعميل
@@ -356,7 +371,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
               // إعادة تعيين مؤقت الصمت
               resetSilenceTimer();
             } else {
-              // نتائج مؤقتة
+              // نتائج مؤقتة - لا نحفظها
               if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ 
                   type: 'transcript', 

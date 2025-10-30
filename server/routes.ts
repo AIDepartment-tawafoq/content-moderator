@@ -273,6 +273,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         alternativeLanguageCodes: ['ar-AE', 'ar-EG'], // لهجات عربية أخرى
         enableAutomaticPunctuation: true,
         model: 'default',
+        singleUtterance: false, // استمرار الاستماع بدون توقف بعد أول صمت
       },
       interimResults: true,
     };
@@ -296,9 +297,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
             const transcript = result.alternatives[0].transcript;
             
             if (result.isFinal) {
-              // نص نهائي - استبدال النص المتراكم بالكامل
-              // ملاحظة: Google يرسل النص الكامل في كل مرة، ليس فقط الجزء الجديد
-              accumulatedTranscript = transcript;
+              // نص نهائي - إضافة الجزء الجديد إلى النص المتراكم
+              // كل utterance نهائي يتم إضافته للنص الكامل
+              accumulatedTranscript += (accumulatedTranscript ? ' ' : '') + transcript;
               
               // حفظ في قاعدة البيانات
               try {

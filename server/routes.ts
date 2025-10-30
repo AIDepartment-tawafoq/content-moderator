@@ -346,8 +346,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
             }
             
             if (result.isFinal) {
-              // نص نهائي - إضافته للنص المتراكم
-              accumulatedTranscript += transcript;
+              // نص نهائي - استبدال النص المتراكم بالكامل
+              // ملاحظة: Google يرسل النص الكامل في كل مرة، ليس فقط الجزء الجديد
+              accumulatedTranscript = transcript;
               
               console.log(`[SAVE] Saving to DB - Session ${sessionId}, Length: ${accumulatedTranscript.length}`);
               

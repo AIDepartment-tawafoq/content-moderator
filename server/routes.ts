@@ -296,11 +296,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
           const result = data.results[0];
           if (result && result.alternatives[0]) {
             const transcript = result.alternatives[0].transcript;
+            const confidence = result.alternatives[0].confidence;
             
             if (result.isFinal) {
               // نص نهائي - إضافة الجزء الجديد إلى النص المتراكم
               // كل utterance نهائي يتم إضافته للنص الكامل
               accumulatedTranscript += (accumulatedTranscript ? ' ' : '') + transcript;
+              
+              console.log(`Final transcript (confidence: ${confidence?.toFixed(2) || 'N/A'}):`, transcript);
               
               // حفظ في قاعدة البيانات
               try {
@@ -366,6 +369,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
     startRecognitionStream();
     resetSilenceTimer();
 
+    // Audio chunk counter for debugging
+    let audioChunkCount = 0;
+    
     // استقبال الرسائل من العميل (بيانات صوتية أو أوامر تحكم)
     ws.on('message', (message: Buffer | string) => {
       // محاولة فك تشفير الرسالة كـ JSON (أوامر التحكم)
@@ -410,6 +416,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // معالجة البيانات الصوتية
       if (!isPaused && recognizeStream && !recognizeStream.destroyed) {
         try {
+          // Debug: Log first few audio chunks
+          audioChunkCount++;
+          if (audioChunkCount <= 3) {
+            const buffer = Buffer.isBuffer(message) ? message : Buffer.from(message);
+            console.log(`Audio chunk ${audioChunkCount}: ${buffer.length} bytes, first 10 bytes:`, 
+              Array.from(buffer.slice(0, 10)).map(b => b.toString(16).padStart(2, '0')).join(' '));
+          }
+          
           // إرسال audio chunks فقط (config تم إرساله مسبقاً عند إنشاء الـ stream)
           // Google Speech API expects raw audio buffer after initial config
           recognizeStream.write(message);

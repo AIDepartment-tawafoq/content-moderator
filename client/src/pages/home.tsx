@@ -63,6 +63,7 @@ export default function Home() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const sessionIdRef = useRef<string>("");
   const consentDataRef = useRef<z.infer<typeof consentFormSchema>>();
+  const isPausedRef = useRef(false); // Use ref to avoid closure issues in audio callbacks
   
   const { toast } = useToast();
 
@@ -171,7 +172,7 @@ export default function Home() {
 
           // Handle audio data from worklet
           workletNode.port.onmessage = (event) => {
-            if (ws.readyState === WebSocket.OPEN && !isPaused) {
+            if (ws.readyState === WebSocket.OPEN && !isPausedRef.current) {
               // Send raw PCM16 buffer to server only if not paused
               ws.send(event.data);
             }
@@ -189,7 +190,7 @@ export default function Home() {
           const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
 
           processor.onaudioprocess = (e) => {
-            if (ws.readyState === WebSocket.OPEN && !isPaused) {
+            if (ws.readyState === WebSocket.OPEN && !isPausedRef.current) {
               const inputData = e.inputBuffer.getChannelData(0);
               
               // Simple downsampling: take every nth sample
@@ -303,6 +304,7 @@ export default function Home() {
     if (isPaused) {
       // Resume
       setIsPaused(false);
+      isPausedRef.current = false; // Sync ref with state
       setRecordingStatus("يتم الآن الاستماع (لا يتم حفظ الصوت)");
       toast({
         title: "تم استئناف التسجيل",
@@ -311,6 +313,7 @@ export default function Home() {
     } else {
       // Pause
       setIsPaused(true);
+      isPausedRef.current = true; // Sync ref with state
       setRecordingStatus("التسجيل متوقف مؤقتاً");
       toast({
         title: "تم إيقاف التسجيل مؤقتاً",

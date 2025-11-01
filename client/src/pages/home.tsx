@@ -301,20 +301,32 @@ export default function Home() {
 
   // Toggle pause/resume recording
   const togglePauseRecording = () => {
+    const ws = wsRef.current;
+    
     if (isPaused) {
-      // Resume
+      // Resume - send resume command to server
       setIsPaused(false);
       isPausedRef.current = false; // Sync ref with state
       setRecordingStatus("يتم الآن الاستماع (لا يتم حفظ الصوت)");
+      
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'resume' }));
+      }
+      
       toast({
         title: "تم استئناف التسجيل",
         description: "التسجيل قيد العمل الآن",
       });
     } else {
-      // Pause
+      // Pause - send pause command to server
       setIsPaused(true);
       isPausedRef.current = true; // Sync ref with state
       setRecordingStatus("التسجيل متوقف مؤقتاً");
+      
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'pause' }));
+      }
+      
       toast({
         title: "تم إيقاف التسجيل مؤقتاً",
         description: "يمكنك استئناف التسجيل في أي وقت",

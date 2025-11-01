@@ -261,6 +261,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     let accumulatedTranscript = '';
     let recognizeStream: any = null;
     let silenceTimer: NodeJS.Timeout | null = null;
+    let isPaused = false;
     const SILENCE_TIMEOUT = 300000; // 5 دقائق من الصمت (300 ثانية)
 
     // إنشاء streaming recognition request للتحويل الصوتي
@@ -365,9 +366,41 @@ export async function registerRoutes(app: Express): Promise<Server> {
     startRecognitionStream();
     resetSilenceTimer();
 
-    // استقبال البيانات الصوتية من العميل
-    ws.on('message', (message: Buffer) => {
-      if (recognizeStream && !recognizeStream.destroyed) {
+    // استقبال الرسائل من العميل (بيانات صوتية أو أوامر تحكم)
+    ws.on('message', (message: Buffer | string) => {
+      // التحقق من الرسائل النصية (أوامر التحكم)
+      if (typeof message === 'string') {
+        try {
+          const command = JSON.parse(message);
+          
+          if (command.type === 'pause') {
+            console.log('Pausing recognition for session:', sessionId);
+            isPaused = true;
+            
+            // إيقاف stream الحالي لتجنب timeout
+            if (recognizeStream && !recognizeStream.destroyed) {
+              recognizeStream.end();
+              recognizeStream = null;
+            }
+            
+            return;
+          } else if (command.type === 'resume') {
+            console.log('Resuming recognition for session:', sessionId);
+            isPaused = false;
+            
+            // إعادة تشغيل stream جديد
+            startRecognitionStream();
+            resetSilenceTimer();
+            
+            return;
+          }
+        } catch (e) {
+          // ليست رسالة JSON، تعامل معها كبيانات صوتية
+        }
+      }
+      
+      // معالجة البيانات الصوتية
+      if (!isPaused && recognizeStream && !recognizeStream.destroyed) {
         try {
           // إرسال audio chunks فقط (config تم إرساله مسبقاً عند إنشاء الـ stream)
           // Google Speech API expects raw audio buffer after initial config

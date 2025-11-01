@@ -368,35 +368,43 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     // استقبال الرسائل من العميل (بيانات صوتية أو أوامر تحكم)
     ws.on('message', (message: Buffer | string) => {
-      // التحقق من الرسائل النصية (أوامر التحكم)
-      if (typeof message === 'string') {
-        try {
-          const command = JSON.parse(message);
-          
-          if (command.type === 'pause') {
-            console.log('Pausing recognition for session:', sessionId);
-            isPaused = true;
+      // محاولة فك تشفير الرسالة كـ JSON (أوامر التحكم)
+      try {
+        const messageStr = typeof message === 'string' ? message : message.toString('utf8');
+        
+        // تحقق مما إذا كانت رسالة JSON صغيرة (< 1000 bytes)
+        // البيانات الصوتية عادة أكبر بكثير
+        if (messageStr.length < 1000) {
+          try {
+            const command = JSON.parse(messageStr);
             
-            // إيقاف stream الحالي لتجنب timeout
-            if (recognizeStream && !recognizeStream.destroyed) {
-              recognizeStream.end();
-              recognizeStream = null;
+            if (command.type === 'pause') {
+              console.log('Pausing recognition for session:', sessionId);
+              isPaused = true;
+              
+              // إيقاف stream الحالي لتجنب timeout
+              if (recognizeStream && !recognizeStream.destroyed) {
+                recognizeStream.end();
+                recognizeStream = null;
+              }
+              
+              return;
+            } else if (command.type === 'resume') {
+              console.log('Resuming recognition for session:', sessionId);
+              isPaused = false;
+              
+              // إعادة تشغيل stream جديد
+              startRecognitionStream();
+              resetSilenceTimer();
+              
+              return;
             }
-            
-            return;
-          } else if (command.type === 'resume') {
-            console.log('Resuming recognition for session:', sessionId);
-            isPaused = false;
-            
-            // إعادة تشغيل stream جديد
-            startRecognitionStream();
-            resetSilenceTimer();
-            
-            return;
+          } catch (jsonError) {
+            // ليست رسالة JSON، تابع للمعالجة كبيانات صوتية
           }
-        } catch (e) {
-          // ليست رسالة JSON، تعامل معها كبيانات صوتية
         }
+      } catch (e) {
+        // خطأ في معالجة الرسالة، تابع للمعالجة كبيانات صوتية
       }
       
       // معالجة البيانات الصوتية

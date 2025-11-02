@@ -3,13 +3,13 @@
 
 ## نظرة عامة | Overview
 
-منصة ويب عربية تعطي الأولوية للخصوصية لتسجيل وتحويل جلسات الاستشارة/الوساطة إلى نص. تجمع المنصة موافقة المستخدم، وتجمع البيانات الوصفية للجلسة من خلال استبيان قصير، ثم تقوم بتحويل الكلام إلى نص في الوقت الفعلي باستخدام Google Cloud Speech API. **لا يتم تخزين أي ملفات صوتية** - يتم حفظ النص المحول فقط في قاعدة البيانات لأغراض تحسين الخدمة.
+منصة ويب عربية تعطي الأولوية للخصوصية لتسجيل وتحويل جلسات المصالحة/الوساطة إلى نص. **المنصة مصممة للمستشارين** - يقوم المستشار ببدء الجلسة، التسجيل مع تحويل الكلام إلى نص في الوقت الفعلي، ثم ملء استبيان تقييمي بعد انتهاء الجلسة. **لا يتم تخزين أي ملفات صوتية** - يتم حفظ النص المحول فقط في قاعدة البيانات لأغراض تحسين الخدمة.
 
-An Arabic-first privacy-focused web application for recording and transcribing counseling/mediation sessions. The platform collects user consent, gathers session metadata through a brief survey, then performs real-time speech-to-text conversion using Google Cloud Speech API. **No audio files are stored** - only the transcribed text is saved to the database for service improvement purposes.
+An Arabic-first privacy-focused web application for recording and transcribing counseling/mediation sessions. **The platform is designed for counselors** - counselors initiate sessions, record with real-time speech-to-text conversion, then fill an evaluation survey after the session ends. **No audio files are stored** - only the transcribed text is saved to the database for service improvement purposes.
 
-التطبيق يركز على الثقة والخصوصية والحساسية الثقافية مع تصميم هادئ واحترافي مصمم للمستخدمين الناطقين بالعربية.
+التطبيق يركز على الثقة والخصوصية والحساسية الثقافية مع تصميم هادئ واحترافي مصمم للمستشارين الناطقين بالعربية.
 
-The application emphasizes trust, privacy, and cultural sensitivity with a calm, professional design tailored for Arabic-speaking users.
+The application emphasizes trust, privacy, and cultural sensitivity with a calm, professional design tailored for Arabic-speaking counselors.
 
 ---
 
@@ -173,37 +173,36 @@ The application emphasizes trust, privacy, and cultural sensitivity with a calm,
 
 ## مراحل التطبيق | Application Phases
 
-التطبيق يتكون من 5 مراحل متسلسلة:
+التطبيق يتكون من 4 مراحل متسلسلة (للمستشار):
 
 ### 1. CTA (Call-to-Action)
 - الصفحة الترحيبية
 - شرح موجز للخدمة
-- زر "ابدأ المشاركة الآن"
+- زر "بدء جلسة جديدة" - يبدأ التسجيل مباشرة
 
-### 2. Consent (الموافقة)
-- 5 نقاط إفصاح واضحة:
-  1. تحويل الجلسة إلى نص للبحث وتحسين الخدمة
-  2. عدم حفظ أي تسجيل صوتي
-  3. المشاركة اختيارية
-  4. حماية البيانات وفق سياسات الخصوصية
-  5. إمكانية الإيقاف في أي وقت
-- حقل اسم اختياري
-- مربع موافقة إلزامي
+### 2. Recording (التسجيل)
+- خلفية سوداء كاملة
+- نقاط متحركة هادئة
+- حالة التسجيل: "جلستكم محمية وآمنة"
+- إمكانية إيقاف مؤقت / استئناف
+- زر "إنهاء الجلسة"
+- إنهاء تلقائي بعد 5 دقائق من الصمت
 
-### 3. Survey (الاستبيان)
+### 3. Survey (تقييم الجلسة - للمستشار)
+بيانات الجلسة:
 - تاريخ الجلسة
 - عدد الأطراف (1-10)
 - نوع العلاقة (زوجان، أقارب، والد وابنه، أخرى)
 - وجود أطفال متأثرين (checkbox)
+- رقم الجلسة (الأولى، الثانية، الثالثة، أكثر من ثلاث)
+- طبيعة المشكلة (خلافات زوجية، أسرية، مالية، حضانة، أخرى)
 
-### 4. Recording (التسجيل)
-- خلفية سوداء كاملة
-- أيقونة ميكروفون نابضة
-- حالة التسجيل: "يتم الآن الاستماع (لا يتم حفظ الصوت)"
-- زر إلغاء متاح
-- إنهاء تلقائي بعد 20 ثانية صمت
+تقييم المستشار:
+- فعالية الجلسة (فعالة جداً، فعالة، متوسطة، غير فعالة)
+- تقدم المصالحة (تقدم ممتاز، تقدم جيد، تقدم ضعيف، لا يوجد تقدم)
+- ملاحظات المستشار (اختياري - حقل نصي)
 
-### 5. Done (الاكتمال)
+### 4. Done (الاكتمال)
 - رسالة شكر
 - أيقونة علامة صح
 - إعادة تعيين تلقائية بعد 5 ثوانٍ

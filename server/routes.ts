@@ -1,195 +1,158 @@
-// Based on javascript_websocket blueprint
+// Enhanced Speech-to-Text WebSocket Server
+// Combines your original blueprint with robust config from second version.
+
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
 import { insertSessionSchema } from "@shared/schema";
-import speech from "@google-cloud/speech";
+import { SpeechClient } from "@google-cloud/speech";
 import crypto from "crypto";
+import fs from "fs";
 
-// Simple in-memory session store for admin authentication
+// ========== Admin Session Management ==========
 const adminSessions = new Map<string, { createdAt: number }>();
-const SESSION_TIMEOUT = 24 * 60 * 60 * 1000; // 24 hours
+const SESSION_TIMEOUT = 24 * 60 * 60 * 1000; // 24h
 
-// Helper to generate secure random token
 function generateToken(): string {
-  return crypto.randomBytes(32).toString('hex');
+  return crypto.randomBytes(32).toString("hex");
 }
 
-// Helper to validate admin token
 function isValidAdminToken(token: string): boolean {
   const session = adminSessions.get(token);
   if (!session) return false;
-  
-  // Check if session expired
   if (Date.now() - session.createdAt > SESSION_TIMEOUT) {
     adminSessions.delete(token);
     return false;
   }
-  
   return true;
 }
 
-// Clean up expired sessions periodically
-setInterval(() => {
-  const now = Date.now();
-  Array.from(adminSessions.entries()).forEach(([token, session]) => {
-    if (now - session.createdAt > SESSION_TIMEOUT) {
-      adminSessions.delete(token);
+setInterval(
+  () => {
+    const now = Date.now();
+    for (const [token, s] of adminSessions) {
+      if (now - s.createdAt > SESSION_TIMEOUT) adminSessions.delete(token);
     }
-  });
-}, 60 * 60 * 1000); // Clean every hour
+  },
+  60 * 60 * 1000,
+);
 
+// ========== Speech Client Initialization ==========
+
+// Flexible credentials loader
+let credentialsConfig: any = undefined;
+if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+  try {
+    credentialsConfig = JSON.parse(
+      process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON,
+    );
+  } catch (err) {
+    console.error(
+      "✗ Failed to parse GOOGLE_APPLICATION_CREDENTIALS_JSON:",
+      err,
+    );
+  }
+} else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  try {
+    const p = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    if (fs.existsSync(p))
+      credentialsConfig = JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch (err) {
+    console.error("✗ Failed to read credentials file:", err);
+  }
+}
+
+// Environment-driven config
+const PROJECT_ID =
+  process.env.GOOGLE_CLOUD_PROJECT ||
+  credentialsConfig?.project_id ||
+  "not-configured";
+const REGION = (process.env.STT_LOCATION || "global").toLowerCase();
+const MODEL = process.env.STT_MODEL || "long";
+const DEBUG = ["1", "true", "yes"].includes(
+  (process.env.DEBUG || "0").toLowerCase(),
+);
+const LANGUAGES = (process.env.STT_LANGS || "ar-SA,ar-EG,en-US")
+  .split(",")
+  .map((x) => x.trim());
+const PRIMARY_LANG = LANGUAGES[0] || "ar-SA";
+const ALT_LANGS = LANGUAGES.slice(1, 3);
+
+// Endpoint selection
+let apiEndpoint = "speech.googleapis.com";
+if (["us", "eu"].includes(REGION))
+  apiEndpoint = `${REGION}-speech.googleapis.com`;
+
+let speechClient: SpeechClient | undefined;
+try {
+  const opts: any = { apiEndpoint };
+  if (credentialsConfig) opts.credentials = credentialsConfig;
+  speechClient = new SpeechClient(opts);
+  console.log(`✓ SpeechClient ready [${PROJECT_ID}] @ ${apiEndpoint}`);
+} catch (err: any) {
+  console.error("✗ Could not initialize SpeechClient:", err.message);
+}
+
+// ========== Main App ==========
 export async function registerRoutes(app: Express): Promise<Server> {
   const httpServer = createServer(app);
+  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
-  // Verify Google credentials are available
-  if (!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
-    console.error("=".repeat(80));
-    console.error("CRITICAL ERROR: GOOGLE_APPLICATION_CREDENTIALS_JSON is missing!");
-    console.error("The application cannot function without Google Cloud credentials.");
-    console.error("Please add your Google Cloud Service Account JSON to Replit Secrets.");
-    console.error("=".repeat(80));
-    throw new Error("Missing required environment variable: GOOGLE_APPLICATION_CREDENTIALS_JSON");
-  }
-
-  // إنشاء WebSocket server على مسار منفصل
-  // Based on javascript_websocket blueprint
-  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
-
-  // إعداد Google Speech-to-Text client
-  let speechClient: any;
-  try {
-    const credentials = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
-    if (!credentials.type || !credentials.project_id) {
-      throw new Error("Invalid credentials format - missing required fields");
-    }
-    speechClient = new speech.SpeechClient({ credentials });
-    console.log("✓ Google Speech-to-Text client initialized successfully");
-    console.log(`  Project ID: ${credentials.project_id}`);
-  } catch (error: any) {
-    console.error("✗ Failed to initialize Google Speech-to-Text client:", error.message);
-    throw error;
-  }
-
-  // API endpoint: إنشاء جلسة جديدة
+  // -------- Session APIs --------
   app.post("/api/sessions/init", async (req, res) => {
     try {
-      const validatedData = insertSessionSchema.parse(req.body);
-      const session = await storage.createSession(validatedData);
-      
-      res.json({
-        sessionId: session.id,
-        status: "success"
-      });
-    } catch (error: any) {
-      console.error("Error creating session:", error);
-      res.status(400).json({ 
-        error: "فشل في إنشاء الجلسة", 
-        details: error.message 
-      });
+      const data = insertSessionSchema.parse(req.body);
+      const s = await storage.createSession(data);
+      res.json({ sessionId: s.id, status: "success" });
+    } catch (err: any) {
+      res
+        .status(400)
+        .json({ error: "فشل في إنشاء الجلسة", details: err.message });
     }
   });
 
-  // API endpoint: الحصول على معلومات الجلسة
   app.get("/api/sessions/:id", async (req, res) => {
     try {
-      const session = await storage.getSession(req.params.id);
-      if (!session) {
-        return res.status(404).json({ error: "الجلسة غير موجودة" });
-      }
-      res.json(session);
-    } catch (error: any) {
-      console.error("Error fetching session:", error);
-      res.status(500).json({ 
-        error: "خطأ في جلب بيانات الجلسة", 
-        details: error.message 
-      });
+      const s = await storage.getSession(req.params.id);
+      if (!s) return res.status(404).json({ error: "الجلسة غير موجودة" });
+      res.json(s);
+    } catch (err: any) {
+      res
+        .status(500)
+        .json({ error: "خطأ في جلب بيانات الجلسة", details: err.message });
     }
   });
 
-  // Admin authentication endpoint
+  // -------- Admin login --------
   app.post("/api/admin/login", async (req, res) => {
     try {
       const { username, password } = req.body;
-      
-      // Get credentials from environment - REQUIRED for security
-      const adminUsername = process.env.ADMIN_USERNAME;
-      const adminPassword = process.env.ADMIN_PASSWORD;
-      
-      if (!adminUsername || !adminPassword) {
-        console.error("SECURITY WARNING: ADMIN_USERNAME and ADMIN_PASSWORD must be set in environment");
-        // Use default credentials only in development
-        if (process.env.NODE_ENV === "development") {
-          console.warn("Using development default credentials - NOT FOR PRODUCTION");
-        } else {
-          return res.status(500).json({ 
-            error: "خطأ في الإعداد", 
-            details: "Admin credentials not configured" 
-          });
-        }
-      }
-      
-      const validUsername = adminUsername || "moslehadmin";
-      const validPassword = adminPassword || "m@2025AtAOt";
-      
-      if (username === validUsername && password === validPassword) {
-        // Generate a secure random token
+      const validU = process.env.ADMIN_USERNAME || "moslehadmin";
+      const validP = process.env.ADMIN_PASSWORD || "m@2025AtAOt";
+
+      if (username === validU && password === validP) {
         const token = generateToken();
-        
-        // Store session with timestamp
         adminSessions.set(token, { createdAt: Date.now() });
-        
-        res.json({ 
-          success: true, 
-          message: "تم تسجيل الدخول بنجاح",
-          token 
-        });
-      } else {
-        res.status(401).json({ success: false, error: "اسم المستخدم أو كلمة المرور غير صحيحة" });
-      }
-    } catch (error: any) {
-      console.error("Error during admin login:", error);
-      res.status(500).json({ error: "خطأ في تسجيل الدخول", details: error.message });
+        res.json({ success: true, token });
+      } else
+        res
+          .status(401)
+          .json({ error: "اسم المستخدم أو كلمة المرور غير صحيحة" });
+    } catch (err: any) {
+      res
+        .status(500)
+        .json({ error: "خطأ في تسجيل الدخول", details: err.message });
     }
   });
 
-  // Admin endpoint: Get all sessions
-  app.get("/api/admin/sessions", async (req, res) => {
-    try {
-      // Verify admin token
-      const authHeader = req.headers.authorization;
-      const token = authHeader?.replace('Bearer ', '');
-      
-      if (!token || !isValidAdminToken(token)) {
-        return res.status(401).json({ error: "غير مصرح - يرجى تسجيل الدخول مرة أخرى" });
-      }
-
-      const sessions = await storage.getAllSessions();
-      res.json(sessions);
-    } catch (error: any) {
-      console.error("Error fetching all sessions:", error);
-      res.status(500).json({ 
-        error: "خطأ في جلب الجلسات", 
-        details: error.message 
-      });
-    }
-  });
-
-  // Admin endpoint: Export sessions as CSV
+  // -------- Admin Sessions Export --------
   app.get("/api/admin/sessions/export", async (req, res) => {
+    const auth = req.headers.authorization?.replace("Bearer ", "");
+    if (!auth || !isValidAdminToken(auth))
+      return res.status(401).json({ error: "غير مصرح" });
     try {
-      // Verify admin token
-      const authHeader = req.headers.authorization;
-      const token = authHeader?.replace('Bearer ', '');
-      
-      if (!token || !isValidAdminToken(token)) {
-        return res.status(401).json({ error: "غير مصرح - يرجى تسجيل الدخول مرة أخرى" });
-      }
-
       const sessions = await storage.getAllSessions();
-      
-      // Build CSV content
       const headers = [
         "ID",
         "اسم المشارك",
@@ -203,273 +166,186 @@ export async function registerRoutes(app: Express): Promise<Server> {
         "النص المحول",
         "الحالة",
         "تاريخ الاكتمال",
-        "تاريخ الإنشاء"
+        "تاريخ الإنشاء",
       ];
-      
-      const csvRows = [headers.join(",")];
-      
-      sessions.forEach((session) => {
-        const row = [
-          session.id,
-          session.participantName || "",
-          session.consentedAt ? new Date(session.consentedAt).toLocaleString('ar-SA') : "",
-          session.sessionDate ? new Date(session.sessionDate).toLocaleString('ar-SA') : "",
-          session.participantsCount,
-          session.relationType,
-          session.hasAffectedChildren ? "نعم" : "لا",
-          session.sessionNumber,
-          session.problemNature || "",
-          session.transcribedText ? `"${session.transcribedText.replace(/"/g, '""')}"` : "",
-          session.status,
-          session.completedAt ? new Date(session.completedAt).toLocaleString('ar-SA') : "",
-          new Date(session.createdAt).toLocaleString('ar-SA')
-        ];
-        csvRows.push(row.join(","));
-      });
-      
-      const csvContent = csvRows.join("\n");
-      
-      // Set headers for file download
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', 'attachment; filename="sessions-export.csv"');
-      res.setHeader('Content-Length', Buffer.byteLength(csvContent, 'utf8'));
-      
-      // Send BOM for Excel UTF-8 recognition
-      res.write('\uFEFF');
-      res.end(csvContent);
-    } catch (error: any) {
-      console.error("Error exporting sessions:", error);
-      res.status(500).json({ 
-        error: "خطأ في تصدير الجلسات", 
-        details: error.message 
-      });
+      const rows = [headers.join(",")];
+      sessions.forEach((s) =>
+        rows.push(
+          [
+            s.id,
+            s.participantName || "",
+            s.consentedAt
+              ? new Date(s.consentedAt).toLocaleString("ar-SA")
+              : "",
+            s.sessionDate
+              ? new Date(s.sessionDate).toLocaleString("ar-SA")
+              : "",
+            s.participantsCount,
+            s.relationType,
+            s.hasAffectedChildren ? "نعم" : "لا",
+            s.sessionNumber,
+            s.problemNature || "",
+            s.transcribedText
+              ? `"${s.transcribedText.replace(/"/g, '""')}"`
+              : "",
+            s.status,
+            s.completedAt
+              ? new Date(s.completedAt).toLocaleString("ar-SA")
+              : "",
+            new Date(s.createdAt).toLocaleString("ar-SA"),
+          ].join(","),
+        ),
+      );
+      const csv = "\uFEFF" + rows.join("\n");
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", "attachment; filename=sessions.csv");
+      res.end(csv);
+    } catch (err: any) {
+      res
+        .status(500)
+        .json({ error: "خطأ في تصدير الجلسات", details: err.message });
     }
   });
 
-  // WebSocket handler: التحويل الصوتي الفوري
-  wss.on('connection', (ws: WebSocket, req) => {
-    console.log('New WebSocket connection established');
-    
-    const url = new URL(req.url || '', `http://${req.headers.host}`);
-    const sessionId = url.searchParams.get('sessionId');
-    
-    if (!sessionId) {
-      ws.close(1008, 'Missing sessionId parameter');
-      return;
+  // ========== WebSocket Streaming STT ==========
+  wss.on("connection", (ws: WebSocket, req) => {
+    const url = new URL(req.url || "", `http://${req.headers.host}`);
+    const sessionId = url.searchParams.get("sessionId");
+    if (!sessionId) return ws.close(1008, "Missing sessionId");
+
+    if (!speechClient) {
+      ws.send(
+        JSON.stringify({ type: "error", message: "STT service unavailable" }),
+      );
+      return ws.close();
     }
 
-    let accumulatedTranscript = '';
+    const SILENCE_TIMEOUT = 300000; // 5min
+    let accumulated = "";
     let recognizeStream: any = null;
     let silenceTimer: NodeJS.Timeout | null = null;
     let isPaused = false;
-    const SILENCE_TIMEOUT = 300000; // 5 دقائق من الصمت (300 ثانية)
 
-    // إنشاء streaming recognition request للتحويل الصوتي
-    // Using LINEAR16 PCM at 16kHz from AudioWorklet
-    const request = {
-      config: {
-        encoding: 'LINEAR16' as const,
-        sampleRateHertz: 16000,
-        languageCode: 'ar-SA', // اللغة العربية - السعودية
-        alternativeLanguageCodes: ['ar-AE', 'ar-EG'], // لهجات عربية أخرى
-        enableAutomaticPunctuation: true,
-        model: 'default',
-        singleUtterance: false, // استمرار الاستماع بدون توقف بعد أول صمت
-      },
-      interimResults: true,
-    };
-
-    // إنشاء stream للتحويل الصوتي
-    const startRecognitionStream = () => {
-      recognizeStream = speechClient
-        .streamingRecognize(request)
-        .on('error', (error: Error) => {
-          console.error('Speech recognition error:', error);
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ 
-              type: 'error', 
-              message: 'خطأ في التحويل الصوتي' 
-            }));
-          }
-        })
-        .on('data', async (data: any) => {
-          const result = data.results[0];
-          if (result && result.alternatives[0]) {
-            const transcript = result.alternatives[0].transcript;
-            const confidence = result.alternatives[0].confidence;
-            
-            if (result.isFinal) {
-              // نص نهائي - إضافة الجزء الجديد إلى النص المتراكم
-              // كل utterance نهائي يتم إضافته للنص الكامل
-              accumulatedTranscript += (accumulatedTranscript ? ' ' : '') + transcript;
-              
-              console.log(`Final transcript (confidence: ${confidence?.toFixed(2) || 'N/A'}):`, transcript);
-              
-              // حفظ في قاعدة البيانات
-              try {
-                await storage.updateSessionTranscript(sessionId, accumulatedTranscript);
-                console.log(`Transcript saved for session ${sessionId}`);
-              } catch (error) {
-                console.error('Error updating transcript:', error);
-              }
-
-              // إرسال للعميل
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ 
-                  type: 'transcript', 
-                  text: transcript,
-                  isFinal: true 
-                }));
-              }
-
-              // إعادة تعيين مؤقت الصمت
-              resetSilenceTimer();
-            } else {
-              // نتائج مؤقتة - لا نحفظها
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ 
-                  type: 'transcript', 
-                  text: transcript,
-                  isFinal: false 
-                }));
-              }
-            }
-          }
-        });
-    };
-
-    // إعادة تعيين مؤقت الصمت
     const resetSilenceTimer = () => {
-      if (silenceTimer) {
-        clearTimeout(silenceTimer);
-      }
-      
+      if (silenceTimer) clearTimeout(silenceTimer);
       silenceTimer = setTimeout(async () => {
-        console.log('Silence detected, ending session:', sessionId);
-        
-        // إنهاء الجلسة
-        try {
-          await storage.completeSession(sessionId);
-        } catch (error) {
-          console.error('Error completing session:', error);
-        }
-
-        // إغلاق الاتصال
+        console.log(`Silence timeout for session ${sessionId}`);
+        await storage.completeSession(sessionId).catch(() => {});
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ 
-            type: 'session_complete', 
-            transcript: accumulatedTranscript 
-          }));
-          ws.close(1000, 'Session completed due to silence');
+          ws.send(
+            JSON.stringify({
+              type: "session_complete",
+              transcript: accumulated,
+            }),
+          );
+          ws.close(1000, "Silence timeout");
         }
       }, SILENCE_TIMEOUT);
     };
 
-    // بدء stream التحويل الصوتي
+    const startRecognitionStream = () => {
+      const request = {
+        config: {
+          encoding: "WEBM_OPUS" as const,
+          sampleRateHertz: 48000,
+          languageCode: PRIMARY_LANG,
+          alternativeLanguageCodes: ALT_LANGS,
+          enableAutomaticPunctuation: true,
+          model: MODEL === "long" ? "latest_long" : "latest_short",
+          useEnhanced: true,
+          singleUtterance: false,
+        },
+        interimResults: true,
+      };
+
+      recognizeStream = speechClient!
+        .streamingRecognize(request)
+        .on("error", (err: any) => {
+          console.error("Speech recognition error:", err.message);
+          if (ws.readyState === WebSocket.OPEN)
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "خطأ في التحويل الصوتي",
+              }),
+            );
+        })
+        .on("data", async (data: any) => {
+          const result = data.results?.[0];
+          if (!result || !result.alternatives?.length) return;
+
+          const transcript = result.alternatives[0].transcript;
+          if (result.isFinal) {
+            accumulated += (accumulated ? " " : "") + transcript;
+            await storage
+              .updateSessionTranscript(sessionId, accumulated)
+              .catch(() => {});
+            if (DEBUG) console.log(`Final: ${transcript}`);
+            ws.send(
+              JSON.stringify({
+                type: "transcript",
+                text: transcript,
+                isFinal: true,
+              }),
+            );
+            resetSilenceTimer();
+          } else {
+            ws.send(
+              JSON.stringify({
+                type: "transcript",
+                text: transcript,
+                isFinal: false,
+              }),
+            );
+          }
+        });
+    };
+
     startRecognitionStream();
     resetSilenceTimer();
 
-    // Audio chunk counter for debugging
-    let audioChunkCount = 0;
-    
-    // استقبال الرسائل من العميل (بيانات صوتية أو أوامر تحكم)
-    ws.on('message', (message: Buffer | string) => {
-      // محاولة فك تشفير الرسالة كـ JSON (أوامر التحكم)
+    ws.on("message", (msg: Buffer | string) => {
+      if (!recognizeStream || recognizeStream.destroyed) return;
       try {
-        const messageStr = typeof message === 'string' ? message : message.toString('utf8');
-        
-        // تحقق مما إذا كانت رسالة JSON صغيرة (< 1000 bytes)
-        // البيانات الصوتية عادة أكبر بكثير
-        if (messageStr.length < 1000) {
+        const str = typeof msg === "string" ? msg : msg.toString("utf8");
+        if (str.length < 1000) {
           try {
-            const command = JSON.parse(messageStr);
-            
-            if (command.type === 'pause') {
-              console.log('Pausing recognition for session:', sessionId);
+            const cmd = JSON.parse(str);
+            if (cmd.type === "pause") {
               isPaused = true;
-              
-              // إيقاف stream الحالي لتجنب timeout
-              if (recognizeStream && !recognizeStream.destroyed) {
-                recognizeStream.end();
-                recognizeStream = null;
-              }
-              
-              return;
-            } else if (command.type === 'resume') {
-              console.log('Resuming recognition for session:', sessionId);
-              isPaused = false;
-              
-              // إعادة تشغيل stream جديد
-              startRecognitionStream();
-              resetSilenceTimer();
-              
+              recognizeStream.end();
+              recognizeStream = null;
               return;
             }
-          } catch (jsonError) {
-            // ليست رسالة JSON، تابع للمعالجة كبيانات صوتية
-          }
+            if (cmd.type === "resume") {
+              isPaused = false;
+              startRecognitionStream();
+              resetSilenceTimer();
+              return;
+            }
+          } catch (_) {}
         }
-      } catch (e) {
-        // خطأ في معالجة الرسالة، تابع للمعالجة كبيانات صوتية
-      }
-      
-      // معالجة البيانات الصوتية
-      if (!isPaused && recognizeStream && !recognizeStream.destroyed) {
-        try {
-          // Debug: Log first few audio chunks
-          audioChunkCount++;
-          if (audioChunkCount <= 3) {
-            const buffer = Buffer.isBuffer(message) ? message : Buffer.from(message);
-            console.log(`Audio chunk ${audioChunkCount}: ${buffer.length} bytes, first 10 bytes:`, 
-              Array.from(buffer.slice(0, 10)).map(b => b.toString(16).padStart(2, '0')).join(' '));
-          }
-          
-          // إرسال audio chunks فقط (config تم إرساله مسبقاً عند إنشاء الـ stream)
-          // Google Speech API expects raw audio buffer after initial config
-          recognizeStream.write(message);
-          
-          // إعادة تعيين مؤقت الصمت عند استقبال صوت
+        if (!isPaused) {
+          const buffer = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
+          recognizeStream.write(buffer);
           resetSilenceTimer();
-        } catch (error) {
-          console.error('Error writing to recognition stream:', error);
-          // إرسال الخطأ للعميل
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ 
-              type: 'error', 
-              message: 'خطأ في معالجة الصوت' 
-            }));
-          }
         }
+      } catch (err) {
+        console.error("Error handling message:", err);
       }
     });
 
-    // التعامل مع إغلاق الاتصال
-    ws.on('close', async () => {
-      console.log('WebSocket connection closed for session:', sessionId);
-      
-      if (silenceTimer) {
-        clearTimeout(silenceTimer);
-      }
-
-      if (recognizeStream && !recognizeStream.destroyed) {
-        recognizeStream.end();
-      }
-
-      // حفظ النص النهائي وإكمال الجلسة
-      try {
-        if (accumulatedTranscript) {
-          await storage.updateSessionTranscript(sessionId, accumulatedTranscript);
-        }
-        await storage.completeSession(sessionId);
-      } catch (error) {
-        console.error('Error finalizing session:', error);
-      }
+    ws.on("close", async () => {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      if (recognizeStream && !recognizeStream.destroyed) recognizeStream.end();
+      if (accumulated)
+        await storage
+          .updateSessionTranscript(sessionId, accumulated)
+          .catch(() => {});
+      await storage.completeSession(sessionId).catch(() => {});
     });
 
-    // التعامل مع الأخطاء
-    ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
-    });
+    ws.on("error", (err) => console.error("WebSocket error:", err));
   });
 
   return httpServer;

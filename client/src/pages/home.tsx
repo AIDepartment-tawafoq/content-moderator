@@ -28,24 +28,19 @@ import { apiRequest } from "@/lib/queryClient";
 import { Link } from "wouter";
 import logoImage from "@assets/logo-tawafoq_1761731886969.png";
 
-type Phase = "cta" | "consent" | "survey" | "recording" | "done";
+type Phase = "cta" | "recording" | "survey" | "done";
 
-// Consent form schema
-const consentFormSchema = z.object({
-  participantName: z.string().optional(),
-  consented: z.boolean().refine((val) => val === true, {
-    message: "يجب الموافقة على الشروط للمتابعة",
-  }),
-});
-
-// Survey form schema
+// Survey form schema (للمستشار بعد انتهاء الجلسة)
 const surveyFormSchema = z.object({
   sessionDate: z.string().min(1, "يرجى اختيار تاريخ الجلسة"),
   participantsCount: z.number().min(1, "يجب أن يكون العدد 1 على الأقل").max(10, "الحد الأقصى 10 أطراف"),
   relationType: z.enum(["زوجان", "أقارب", "والد وابنه", "أخرى"]),
   hasAffectedChildren: z.boolean(),
   sessionNumber: z.enum(["الأولى", "الثانية", "الثالثة", "أكثر من ثلاث"]),
-  problemNature: z.enum(["خلافات زوجية", "خلافات أسرية", "خلافات مالية", "خلافات على الحضانة", "خلافات أخرى"]).optional(),
+  problemNature: z.enum(["خلافات زوجية", "خلافات أسرية", "خلافات مالية", "خلافات على الحضانة", "خلافات أخرى"]),
+  sessionEffectiveness: z.enum(["فعالة جداً", "فعالة", "متوسطة", "غير فعالة"]),
+  reconciliationProgress: z.enum(["تقدم ممتاز", "تقدم جيد", "تقدم ضعيف", "لا يوجد تقدم"]),
+  counselorNotes: z.string().optional(),
 });
 
 export default function Home() {
@@ -62,21 +57,11 @@ export default function Home() {
   const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const sessionIdRef = useRef<string>("");
-  const consentDataRef = useRef<z.infer<typeof consentFormSchema>>();
   const isPausedRef = useRef(false); // Use ref to avoid closure issues in audio callbacks
   
   const { toast } = useToast();
 
-  // Consent form
-  const consentForm = useForm<z.infer<typeof consentFormSchema>>({
-    resolver: zodResolver(consentFormSchema),
-    defaultValues: {
-      participantName: "",
-      consented: false,
-    },
-  });
-
-  // Survey form
+  // Survey form (يتم ملؤه من قبل المستشار بعد الجلسة)
   const surveyForm = useForm<z.infer<typeof surveyFormSchema>>({
     resolver: zodResolver(surveyFormSchema),
     defaultValues: {
@@ -85,35 +70,20 @@ export default function Home() {
       relationType: "زوجان",
       hasAffectedChildren: false,
       sessionNumber: "الأولى",
-      problemNature: undefined,
+      problemNature: "خلافات زوجية",
+      sessionEffectiveness: "فعالة",
+      reconciliationProgress: "تقدم جيد",
+      counselorNotes: "",
     },
   });
 
-  // Handle consent form submission
-  const onConsentSubmit = (data: z.infer<typeof consentFormSchema>) => {
-    consentDataRef.current = data;
-    setPhase("survey");
-  };
-
-  // Handle survey form submission and start recording
-  const onSurveySubmit = async (data: z.infer<typeof surveyFormSchema>) => {
+  // بدء التسجيل مباشرة من صفحة CTA
+  const startRecording = async () => {
     try {
       setError("");
       
-      // Create new session on server
-      const res = await apiRequest(
-        "POST",
-        "/api/sessions/init",
-        {
-          participantName: consentDataRef.current?.participantName || undefined,
-          sessionDate: data.sessionDate,
-          participantsCount: data.participantsCount,
-          relationType: data.relationType,
-          hasAffectedChildren: data.hasAffectedChildren,
-          sessionNumber: data.sessionNumber,
-          problemNature: data.problemNature,
-        }
-      );
+      // Create new session on server (no form data needed)
+      const res = await apiRequest("POST", "/api/sessions/init", {});
 
       const response = await res.json() as { sessionId: string };
 
@@ -290,13 +260,8 @@ export default function Home() {
 
     setIsRecording(false);
     setIsDimmed(false);
-    setPhase("done");
-    setRecordingStatus("شكراً لمساهمتك، تم حفظ النص بأمان");
-
-    // Reset after 5 seconds
-    setTimeout(() => {
-      resetSession();
-    }, 5000);
+    setPhase("survey"); // Go to survey phase for counselor to fill
+    setRecordingStatus("");
   };
 
   // Toggle pause/resume recording
@@ -334,7 +299,7 @@ export default function Home() {
     }
   };
 
-  // Reset session for next user
+  // Reset session for next counselor session
   const resetSession = () => {
     setPhase("cta");
     setIsDimmed(false);
@@ -343,18 +308,63 @@ export default function Home() {
     setCurrentTranscript("");
     setError("");
     sessionIdRef.current = "";
-    consentDataRef.current = undefined;
+    setIsPaused(false);
+    isPausedRef.current = false;
     
-    // Reset forms
-    consentForm.reset();
+    // Reset survey form
     surveyForm.reset({
       sessionDate: new Date().toISOString().split('T')[0],
       participantsCount: 2,
       relationType: "زوجان",
       hasAffectedChildren: false,
       sessionNumber: "الأولى",
-      problemNature: undefined,
+      problemNature: "خلافات زوجية",
+      sessionEffectiveness: "فعالة",
+      reconciliationProgress: "تقدم جيد",
+      counselorNotes: "",
     });
+  };
+
+  // Handle survey form submission (after recording)
+  const onSurveySubmit = async (data: z.infer<typeof surveyFormSchema>) => {
+    try {
+      setError("");
+      
+      // Update session with survey data
+      const res = await apiRequest(
+        "POST",
+        `/api/sessions/${sessionIdRef.current}/complete`,
+        data
+      );
+
+      const response = await res.json();
+
+      if (!response.success) {
+        throw new Error("فشل في حفظ بيانات الجلسة");
+      }
+
+      toast({
+        title: "تم حفظ البيانات بنجاح",
+        description: "تم حفظ بيانات الجلسة وتقييمك",
+      });
+
+      setPhase("done");
+
+      // Reset after 5 seconds
+      setTimeout(() => {
+        resetSession();
+      }, 5000);
+
+    } catch (err: any) {
+      console.error("Error saving survey data:", err);
+      const errorMessage = err.message || "فشل في حفظ البيانات";
+      setError(errorMessage);
+      toast({
+        title: "خطأ",
+        description: errorMessage,
+        variant: "destructive",
+      });
+    }
   };
 
   // Cleanup resources on unmount
@@ -415,131 +425,26 @@ export default function Home() {
             </CardHeader>
             <CardContent className="p-6 md:p-8 pt-0">
               <Button
-                onClick={() => setPhase("consent")}
+                onClick={startRecording}
                 className="w-full rounded-xl h-12 text-base font-semibold hover-elevate active-elevate-2"
-                data-testid="button-start-sharing"
+                data-testid="button-start-recording"
               >
-                ابدأ المشاركة الآن
-                <ChevronRight className="w-5 h-5 mr-2 rotate-180" />
+                بدء جلسة جديدة
+                <Mic className="w-5 h-5 mr-2" />
               </Button>
             </CardContent>
           </Card>
         )}
 
-        {/* Phase 2: Consent */}
-        {phase === "consent" && (
-          <Card className="shadow-xl" data-testid="card-consent">
-            <CardHeader className="p-6 md:p-8">
-              <CardTitle className="text-xl md:text-2xl font-semibold mb-4 font-arabic-display">
-                الموافقة على التسجيل
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="p-6 md:p-8 pt-0">
-              <Form {...consentForm}>
-                <form onSubmit={consentForm.handleSubmit(onConsentSubmit)} className="space-y-6">
-                  {/* Consent points */}
-                  <div className="border rounded-lg p-4 bg-muted/30">
-                    <ul className="list-disc pr-5 space-y-2 text-sm md:text-base leading-relaxed font-arabic">
-                      <li>سيتم تحويل الجلسة إلى نص لأغراض البحث وتحسين الخدمة فقط.</li>
-                      <li>لن يتم حفظ أي تسجيل صوتي بعد تحويله.</li>
-                      <li>المشاركة اختيارية ولا تؤثر على خدماتك.</li>
-                      <li>جميع البيانات محمية وفق سياسات الخصوصية الصارمة.</li>
-                      <li>يمكنك إيقاف المشاركة في أي وقت.</li>
-                    </ul>
-                  </div>
-
-                  {/* Optional name field */}
-                  <FormField
-                    control={consentForm.control}
-                    name="participantName"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel className="font-arabic">الاسم (اختياري)</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            placeholder="أدخل اسمك هنا"
-                            className="h-11 px-4 font-arabic"
-                            data-testid="input-participant-name"
-                          />
-                        </FormControl>
-                        <FormMessage className="font-arabic" />
-                      </FormItem>
-                    )}
-                  />
-
-                  {/* Privacy Policy Link */}
-                  <div className="p-4 rounded-lg bg-muted/30 border">
-                    <p className="text-sm leading-relaxed font-arabic mb-2">
-                      قبل الموافقة، يرجى قراءة{" "}
-                      <Link href="/privacy-policy">
-                        <a className="text-primary hover:underline font-semibold" data-testid="link-privacy-policy">
-                          سياسة الخصوصية وحماية البيانات
-                        </a>
-                      </Link>
-                      {" "}للتعرف على كيفية معالجة بياناتك وفقاً لنظام حماية البيانات الشخصية (PDPL).
-                    </p>
-                  </div>
-
-                  {/* Consent checkbox */}
-                  <FormField
-                    control={consentForm.control}
-                    name="consented"
-                    render={({ field }) => (
-                      <FormItem className="flex items-start gap-3 p-4 border rounded-lg hover-elevate">
-                        <FormControl>
-                          <Checkbox
-                            checked={field.value}
-                            onCheckedChange={field.onChange}
-                            className="w-5 h-5 mt-0.5"
-                            data-testid="checkbox-consent"
-                          />
-                        </FormControl>
-                        <div className="flex-1">
-                          <FormLabel className="text-sm leading-relaxed cursor-pointer font-arabic">
-                            أوافق على الشروط وسياسة الخصوصية وأؤكد رغبتي في المشاركة الطوعية
-                          </FormLabel>
-                          <FormMessage className="font-arabic mt-1" />
-                        </div>
-                      </FormItem>
-                    )}
-                  />
-
-                  {/* Navigation buttons */}
-                  <div className="flex gap-3 justify-end pt-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => setPhase("cta")}
-                      className="px-6 font-arabic"
-                      data-testid="button-back-to-cta"
-                    >
-                      رجوع
-                    </Button>
-                    <Button
-                      type="submit"
-                      className="px-6 font-arabic hover-elevate active-elevate-2"
-                      data-testid="button-next-to-survey"
-                    >
-                      التالي
-                      <ChevronRight className="w-4 h-4 mr-2 rotate-180" />
-                    </Button>
-                  </div>
-                </form>
-              </Form>
-            </CardContent>
-          </Card>
-        )}
-
-        {/* Phase 3: Survey */}
+        {/* Phase 2: Survey (للمستشار بعد انتهاء التسجيل) */}
         {phase === "survey" && (
           <Card className="shadow-xl" data-testid="card-survey">
             <CardHeader className="p-6 md:p-8">
               <CardTitle className="text-xl md:text-2xl font-semibold mb-2 font-arabic-display">
-                الاستبيان القصير
+                تقييم الجلسة
               </CardTitle>
               <CardDescription className="text-sm font-arabic">
-                ساعدنا في فهم سياق الجلسة لتحسين خدماتنا
+                يرجى ملء البيانات التالية لتوثيق الجلسة وتقييمها
               </CardDescription>
             </CardHeader>
             <CardContent className="p-6 md:p-8 pt-0">
@@ -674,13 +579,13 @@ export default function Home() {
                     )}
                   />
 
-                  {/* Problem nature (optional) */}
+                  {/* Problem nature */}
                   <FormField
                     control={surveyForm.control}
                     name="problemNature"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel className="font-arabic">طبيعة المشكلة (اختياري)</FormLabel>
+                        <FormLabel className="font-arabic">طبيعة المشكلة</FormLabel>
                         <Select onValueChange={field.onChange} value={field.value}>
                           <FormControl>
                             <SelectTrigger
@@ -703,23 +608,90 @@ export default function Home() {
                     )}
                   />
 
-                  {/* Navigation buttons */}
-                  <div className="flex gap-3 justify-end pt-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => setPhase("consent")}
-                      className="px-6 font-arabic"
-                      data-testid="button-back-to-consent"
-                    >
-                      رجوع
-                    </Button>
+                  {/* Session Effectiveness (Counselor Evaluation) */}
+                  <FormField
+                    control={surveyForm.control}
+                    name="sessionEffectiveness"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="font-arabic">تقييم فعالية الجلسة</FormLabel>
+                        <Select onValueChange={field.onChange} value={field.value}>
+                          <FormControl>
+                            <SelectTrigger
+                              className="h-11 font-arabic"
+                              data-testid="select-session-effectiveness"
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent className="font-arabic">
+                            <SelectItem value="فعالة جداً">فعالة جداً</SelectItem>
+                            <SelectItem value="فعالة">فعالة</SelectItem>
+                            <SelectItem value="متوسطة">متوسطة</SelectItem>
+                            <SelectItem value="غير فعالة">غير فعالة</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <FormMessage className="font-arabic" />
+                      </FormItem>
+                    )}
+                  />
+
+                  {/* Reconciliation Progress (Counselor Evaluation) */}
+                  <FormField
+                    control={surveyForm.control}
+                    name="reconciliationProgress"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="font-arabic">تقدم المصالحة</FormLabel>
+                        <Select onValueChange={field.onChange} value={field.value}>
+                          <FormControl>
+                            <SelectTrigger
+                              className="h-11 font-arabic"
+                              data-testid="select-reconciliation-progress"
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent className="font-arabic">
+                            <SelectItem value="تقدم ممتاز">تقدم ممتاز</SelectItem>
+                            <SelectItem value="تقدم جيد">تقدم جيد</SelectItem>
+                            <SelectItem value="تقدم ضعيف">تقدم ضعيف</SelectItem>
+                            <SelectItem value="لا يوجد تقدم">لا يوجد تقدم</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <FormMessage className="font-arabic" />
+                      </FormItem>
+                    )}
+                  />
+
+                  {/* Counselor Notes (Optional) */}
+                  <FormField
+                    control={surveyForm.control}
+                    name="counselorNotes"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="font-arabic">ملاحظات المستشار (اختياري)</FormLabel>
+                        <FormControl>
+                          <Textarea
+                            {...field}
+                            placeholder="أضف أي ملاحظات أو تعليقات حول الجلسة"
+                            className="min-h-[100px] font-arabic"
+                            data-testid="textarea-counselor-notes"
+                          />
+                        </FormControl>
+                        <FormMessage className="font-arabic" />
+                      </FormItem>
+                    )}
+                  />
+
+                  {/* Submit button */}
+                  <div className="flex justify-end pt-2">
                     <Button
                       type="submit"
-                      className="px-6 font-arabic hover-elevate active-elevate-2"
-                      data-testid="button-start-recording"
+                      className="px-8 font-arabic hover-elevate active-elevate-2"
+                      data-testid="button-submit-survey"
                     >
-                      ابدأ الجلسة
+                      حفظ البيانات
                     </Button>
                   </div>
                 </form>

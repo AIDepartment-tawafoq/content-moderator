@@ -260,8 +260,16 @@ export default function Home() {
 
     setIsRecording(false);
     setIsDimmed(false);
+    setIsPaused(false);
+    isPausedRef.current = false;
+    setError(""); // Clear any previous errors
     setPhase("survey"); // Go to survey phase for counselor to fill
     setRecordingStatus("");
+    
+    toast({
+      title: "تم إنهاء الجلسة",
+      description: "يرجى ملء استمارة التقييم",
+    });
   };
 
   // Toggle pause/resume recording
@@ -415,10 +423,10 @@ export default function Home() {
                 </div>
                 <div className="flex-1">
                   <CardTitle className="text-2xl md:text-3xl font-bold leading-relaxed mb-2 font-arabic-display">
-                    شارك تجربتك بسرية لتحسين خدماتنا
+                    منصة تسجيل وتقييم جلسات المصالحة
                   </CardTitle>
                   <CardDescription className="text-base md:text-lg leading-relaxed font-arabic">
-                    سيتم تحويل كلامك إلى نص بشكل فوري لتحسين خدماتنا. لا يتم حفظ أي تسجيل صوتي.
+                    تسجيل آمن ومحمي للجلسات مع تحويل فوري للنص. لا يتم حفظ الملفات الصوتية.
                   </CardDescription>
                 </div>
               </div>

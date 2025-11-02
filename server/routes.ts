@@ -5,7 +5,7 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
-import { insertSessionSchema } from "@shared/schema";
+import { initSessionSchema, updateSessionSchema } from "@shared/schema";
 import { SpeechClient } from "@google-cloud/speech";
 import crypto from "crypto";
 import fs from "fs";
@@ -31,9 +31,9 @@ function isValidAdminToken(token: string): boolean {
 setInterval(
   () => {
     const now = Date.now();
-    for (const [token, s] of adminSessions) {
+    adminSessions.forEach((s, token) => {
       if (now - s.createdAt > SESSION_TIMEOUT) adminSessions.delete(token);
-    }
+    });
   },
   60 * 60 * 1000,
 );
@@ -100,15 +100,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
   // -------- Session APIs --------
+  // إنشاء جلسة جديدة (بدون بيانات - فقط session ID)
   app.post("/api/sessions/init", async (req, res) => {
     try {
-      const data = insertSessionSchema.parse(req.body);
-      const s = await storage.createSession(data);
+      // No form data needed - just create an empty session
+      const s = await storage.createSession();
       res.json({ sessionId: s.id, status: "success" });
     } catch (err: any) {
       res
         .status(400)
         .json({ error: "فشل في إنشاء الجلسة", details: err.message });
+    }
+  });
+
+  // تحديث بيانات الجلسة بعد الانتهاء (الاستبيان والتقييم)
+  app.post("/api/sessions/:id/complete", async (req, res) => {
+    try {
+      const data = updateSessionSchema.parse(req.body);
+      const s = await storage.updateSessionMetadata(req.params.id, data);
+      if (!s) return res.status(404).json({ error: "الجلسة غير موجودة" });
+      res.json({ success: true, session: s });
+    } catch (err: any) {
+      res
+        .status(400)
+        .json({ error: "فشل في تحديث الجلسة", details: err.message });
     }
   });
 
@@ -155,14 +170,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const sessions = await storage.getAllSessions();
       const headers = [
         "ID",
-        "اسم المشارك",
-        "تاريخ الموافقة",
         "تاريخ الجلسة",
         "عدد الأطراف",
         "نوع العلاقة",
         "يوجد أطفال متأثرون",
         "رقم الجلسة",
         "طبيعة المشكلة",
+        "فعالية الجلسة",
+        "تقدم المصالحة",
+        "ملاحظات المستشار",
         "النص المحول",
         "الحالة",
         "تاريخ الاكتمال",
@@ -173,18 +189,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
         rows.push(
           [
             s.id,
-            s.participantName || "",
-            s.consentedAt
-              ? new Date(s.consentedAt).toLocaleString("ar-SA")
-              : "",
             s.sessionDate
               ? new Date(s.sessionDate).toLocaleString("ar-SA")
               : "",
-            s.participantsCount,
-            s.relationType,
+            s.participantsCount || "",
+            s.relationType || "",
             s.hasAffectedChildren ? "نعم" : "لا",
-            s.sessionNumber,
+            s.sessionNumber || "",
             s.problemNature || "",
+            s.sessionEffectiveness || "",
+            s.reconciliationProgress || "",
+            s.counselorNotes ? `"${s.counselorNotes.replace(/"/g, '""')}"` : "",
             s.transcribedText
               ? `"${s.transcribedText.replace(/"/g, '""')}"`
               : "",

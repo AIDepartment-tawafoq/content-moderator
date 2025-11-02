@@ -200,12 +200,13 @@ export default function AdminSessions() {
                   <TableHeader>
                     <TableRow>
                       <TableHead className="text-right">المعرف</TableHead>
-                      <TableHead className="text-right">اسم المشارك</TableHead>
                       <TableHead className="text-right">تاريخ الجلسة</TableHead>
                       <TableHead className="text-right">عدد الأطراف</TableHead>
                       <TableHead className="text-right">نوع العلاقة</TableHead>
                       <TableHead className="text-right">رقم الجلسة</TableHead>
                       <TableHead className="text-right">طبيعة المشكلة</TableHead>
+                      <TableHead className="text-right">فعالية الجلسة</TableHead>
+                      <TableHead className="text-right">تقدم المصالحة</TableHead>
                       <TableHead className="text-right">النص المحول</TableHead>
                       <TableHead className="text-right">الحالة</TableHead>
                       <TableHead className="text-right">تاريخ الإنشاء</TableHead>
@@ -217,16 +218,17 @@ export default function AdminSessions() {
                         <TableCell className="font-mono text-xs">
                           {session.id.substring(0, 8)}...
                         </TableCell>
-                        <TableCell>{session.participantName || "-"}</TableCell>
                         <TableCell>
                           {session.sessionDate
                             ? new Date(session.sessionDate).toLocaleDateString("ar-SA")
                             : "-"}
                         </TableCell>
-                        <TableCell>{session.participantsCount}</TableCell>
-                        <TableCell>{session.relationType}</TableCell>
-                        <TableCell>{session.sessionNumber}</TableCell>
+                        <TableCell>{session.participantsCount || "-"}</TableCell>
+                        <TableCell>{session.relationType || "-"}</TableCell>
+                        <TableCell>{session.sessionNumber || "-"}</TableCell>
                         <TableCell>{session.problemNature || "-"}</TableCell>
+                        <TableCell>{session.sessionEffectiveness || "-"}</TableCell>
+                        <TableCell>{session.reconciliationProgress || "-"}</TableCell>
                         <TableCell className="max-w-xs">
                           {session.transcribedText ? (
                             <div className="truncate" title={session.transcribedText}>

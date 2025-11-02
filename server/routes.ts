@@ -161,6 +161,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // -------- Admin Sessions List --------
+  app.get("/api/admin/sessions", async (req, res) => {
+    const auth = req.headers.authorization?.replace("Bearer ", "");
+    if (!auth || !isValidAdminToken(auth))
+      return res.status(401).json({ error: "غير مصرح" });
+    try {
+      const sessions = await storage.getAllSessions();
+      res.json(sessions);
+    } catch (err: any) {
+      res
+        .status(500)
+        .json({ error: "خطأ في جلب الجلسات", details: err.message });
+    }
+  });
+
   // -------- Admin Sessions Export --------
   app.get("/api/admin/sessions/export", async (req, res) => {
     const auth = req.headers.authorization?.replace("Bearer ", "");

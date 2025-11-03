@@ -251,9 +251,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
 
     const SILENCE_TIMEOUT = 300000; // 5min
+    const STREAM_RESTART_INTERVAL = 270000; // 4.5min - restart before Google's 5min limit
     let accumulated = "";
     let recognizeStream: any = null;
     let silenceTimer: NodeJS.Timeout | null = null;
+    let streamRestartTimer: NodeJS.Timeout | null = null;
     let isPaused = false;
 
     const resetSilenceTimer = () => {
@@ -271,6 +273,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
           ws.close(1000, "Silence timeout");
         }
       }, SILENCE_TIMEOUT);
+    };
+
+    const restartRecognitionStream = () => {
+      console.log(`Restarting recognition stream for session ${sessionId} to handle long duration`);
+      if (recognizeStream && !recognizeStream.destroyed) {
+        recognizeStream.end();
+      }
+      startRecognitionStream();
     };
 
     const startRecognitionStream = () => {
@@ -329,6 +339,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
             );
           }
         });
+
+      // Set up automatic stream restart before hitting Google's limit
+      if (streamRestartTimer) clearTimeout(streamRestartTimer);
+      streamRestartTimer = setTimeout(() => {
+        if (!isPaused && ws.readyState === WebSocket.OPEN) {
+          restartRecognitionStream();
+        }
+      }, STREAM_RESTART_INTERVAL);
     };
 
     startRecognitionStream();
@@ -343,6 +361,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             const cmd = JSON.parse(str);
             if (cmd.type === "pause") {
               isPaused = true;
+              if (streamRestartTimer) clearTimeout(streamRestartTimer);
               recognizeStream.end();
               recognizeStream = null;
               return;
@@ -367,6 +386,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     ws.on("close", async () => {
       if (silenceTimer) clearTimeout(silenceTimer);
+      if (streamRestartTimer) clearTimeout(streamRestartTimer);
       if (recognizeStream && !recognizeStream.destroyed) recognizeStream.end();
       if (accumulated)
         await storage

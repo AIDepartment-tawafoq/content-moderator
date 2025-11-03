@@ -31,6 +31,7 @@ The application features a dark, calming aesthetic during recording, using new b
 - **RTL Support**: Full right-to-left language support for the Arabic interface.
 - **Pause/Resume Recording**: Functionality to temporarily halt and restart recording.
 - **Auto-completion**: Sessions automatically end after 5 minutes of silence.
+- **Long Session Support**: Automatic stream restart every 4.5 minutes to handle Google's ~5-minute streaming limit. Supports sessions of 1-2 hours or longer without data loss.
 
 ## External Dependencies
 

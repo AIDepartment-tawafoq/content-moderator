@@ -276,8 +276,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const startRecognitionStream = () => {
       const request = {
         config: {
-          encoding: "WEBM_OPUS" as const,
-          sampleRateHertz: 48000,
+          encoding: "LINEAR16" as const,
+          sampleRateHertz: 16000,
           languageCode: PRIMARY_LANG,
           alternativeLanguageCodes: ALT_LANGS,
           enableAutomaticPunctuation: true,

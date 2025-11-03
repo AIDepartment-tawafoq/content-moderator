@@ -70,14 +70,16 @@ const PROJECT_ID =
   "not-configured";
 const REGION = (process.env.STT_LOCATION || "global").toLowerCase();
 const MODEL = process.env.STT_MODEL || "long";
+// Enable debug mode by default to track transcription issues
 const DEBUG = ["1", "true", "yes"].includes(
-  (process.env.DEBUG || "0").toLowerCase(),
+  (process.env.DEBUG || "1").toLowerCase(),
 );
-const LANGUAGES = (process.env.STT_LANGS || "ar-SA,ar-EG,en-US")
+// Force Arabic-only transcription - no English alternatives
+const LANGUAGES = (process.env.STT_LANGS || "ar-SA,ar-EG,ar-AE")
   .split(",")
   .map((x) => x.trim());
 const PRIMARY_LANG = LANGUAGES[0] || "ar-SA";
-const ALT_LANGS = LANGUAGES.slice(1, 3);
+const ALT_LANGS = LANGUAGES.slice(1, 3).filter(lang => lang.startsWith('ar-'));
 
 // Endpoint selection
 let apiEndpoint = "speech.googleapis.com";
@@ -284,6 +286,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
     };
 
     const startRecognitionStream = () => {
+      console.log(`Starting recognition stream for session ${sessionId} with language: ${PRIMARY_LANG}`);
+      
       const request = {
         config: {
           encoding: "LINEAR16" as const,
@@ -291,17 +295,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
           languageCode: PRIMARY_LANG,
           alternativeLanguageCodes: ALT_LANGS,
           enableAutomaticPunctuation: true,
-          model: MODEL === "long" ? "latest_long" : "latest_short",
+          model: "latest_long", // Always use long model for better accuracy
           useEnhanced: true,
           singleUtterance: false,
         },
         interimResults: true,
       };
 
+      console.log(`Recognition config:`, JSON.stringify(request.config, null, 2));
+
       recognizeStream = speechClient!
         .streamingRecognize(request)
         .on("error", (err: any) => {
-          console.error("Speech recognition error:", err.message);
+          console.error(`Speech recognition error for session ${sessionId}:`, err.message);
           if (ws.readyState === WebSocket.OPEN)
             ws.send(
               JSON.stringify({
@@ -315,12 +321,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
           if (!result || !result.alternatives?.length) return;
 
           const transcript = result.alternatives[0].transcript;
+          const detectedLang = result.languageCode || PRIMARY_LANG;
+          
+          if (DEBUG) console.log(`Transcript (${detectedLang}, final=${result.isFinal}): ${transcript}`);
+          
           if (result.isFinal) {
             accumulated += (accumulated ? " " : "") + transcript;
             await storage
               .updateSessionTranscript(sessionId, accumulated)
-              .catch(() => {});
-            if (DEBUG) console.log(`Final: ${transcript}`);
+              .catch((err) => {
+                console.error(`Failed to save transcript for session ${sessionId}:`, err);
+              });
+            console.log(`Saved final transcript. Total length: ${accumulated.length} characters`);
             ws.send(
               JSON.stringify({
                 type: "transcript",
@@ -344,6 +356,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (streamRestartTimer) clearTimeout(streamRestartTimer);
       streamRestartTimer = setTimeout(() => {
         if (!isPaused && ws.readyState === WebSocket.OPEN) {
+          console.log(`Auto-restarting stream for session ${sessionId} after ${STREAM_RESTART_INTERVAL/1000} seconds`);
           restartRecognitionStream();
         }
       }, STREAM_RESTART_INTERVAL);

@@ -1,316 +1,38 @@
 # منصة تسجيل جلسات المصالحة العربية
 # Arabic Session Recording Platform
 
-## نظرة عامة | Overview
-
-منصة ويب عربية تعطي الأولوية للخصوصية لتسجيل وتحويل جلسات المصالحة/الوساطة إلى نص. **المنصة مصممة للمستشارين** - يقوم المستشار ببدء الجلسة، التسجيل مع تحويل الكلام إلى نص في الوقت الفعلي، ثم ملء استبيان تقييمي بعد انتهاء الجلسة. **لا يتم تخزين أي ملفات صوتية** - يتم حفظ النص المحول فقط في قاعدة البيانات لأغراض تحسين الخدمة.
-
-An Arabic-first privacy-focused web application for recording and transcribing counseling/mediation sessions. **The platform is designed for counselors** - counselors initiate sessions, record with real-time speech-to-text conversion, then fill an evaluation survey after the session ends. **No audio files are stored** - only the transcribed text is saved to the database for service improvement purposes.
-
-التطبيق يركز على الثقة والخصوصية والحساسية الثقافية مع تصميم هادئ واحترافي مصمم للمستشارين الناطقين بالعربية.
-
-The application emphasizes trust, privacy, and cultural sensitivity with a calm, professional design tailored for Arabic-speaking counselors.
-
----
-
-## التحديثات الأخيرة | Recent Changes (October 29, 2025)
-
-### 🆕 لوحة الإدارة | Admin Panel (NEW)
-
-تم إضافة لوحة إدارة آمنة لعرض وتصدير الجلسات:
-
-**المميزات**:
-- 🔐 نظام مصادقة آمن بـ tokens عشوائية (24 ساعة صلاحية)
-- 📊 عرض جميع الجلسات في جدول منظم
-- 📥 تصدير CSV لجميع البيانات (مع دعم UTF-8 للعربية)
-- 🚪 تسجيل دخول/خروج آمن
-
-**المسارات**:
-- `/admin/login` - صفحة تسجيل الدخول
-- `/admin/sessions` - عرض الجلسات (يتطلب تسجيل دخول)
-
-**بيانات الاعتماد الافتراضية** (development فقط):
-- اسم المستخدم: `moslehadmin`
-- كلمة المرور: `m@2025AtAOt`
-
-**⚠️ مهم للإنتاج**:
-يجب تعيين `ADMIN_USERNAME` و `ADMIN_PASSWORD` في environment variables
-
-**الأمان**:
-- Tokens عشوائية آمنة (crypto.randomBytes)
-- Session management على الخادم
-- Token expiration بعد 24 ساعة
-- تنظيف تلقائي للـ sessions منتهية الصلاحية
-
----
-
-### ✅ التحسينات المنجزة | Completed Improvements
-
-1. **معالجة الصوت المحسنة | Enhanced Audio Processing**
-   - تم تطبيق AudioWorklet لمعالجة الصوت بجودة عالية
-   - Downsampling تلقائي إلى 16kHz LINEAR16 PCM
-   - Fallback إلى ScriptProcessorNode للمتصفحات القديمة
-   - ملف `/audio-processor.js` للمعالجة في الخلفية
-
-2. **إصلاح تكامل Google Speech-to-Text**
-   - تم إصلاح تنسيق البيانات الصوتية (إرسال config أولاً ثم audio chunks)
-   - تحويل الكلام إلى نص بجودة عالية للغة العربية (ar-SA, ar-AE, ar-EG)
-   - تمديد مهلة الصمت من 20 ثانية إلى 5 دقائق
-   - معالجة أخطاء محسنة مع إرسال الأخطاء للعميل
-   - إضافة علامات ترقيم تلقائية للنص المحول
-
-3. **تحديثات قاعدة البيانات | Database Updates**
-   - إضافة حقل `sessionNumber` (الأولى، الثانية، الثالثة، أكثر من ثلاث)
-   - إضافة حقل `problemNature` (خلافات زوجية، أسرية، مالية، حضانة، أخرى)
-   - تطبيق التغييرات بنجاح عبر `npm run db:push --force`
-
-4. **صفحة سياسة الخصوصية | Privacy Policy Page**
-   - صفحة شاملة عند `/privacy-policy`
-   - إشارة واضحة إلى SDAIA PDPL
-   - التركيز على البحث والإحصاءات
-   - رابط من نموذج الموافقة
-
-5. **تحديثات التصميم | Design Updates**
-   - ألوان جديدة من اللوغو: برتقالي (Primary #E88F3A) وأزرق فيروزي (Secondary #1B9AAA)
-   - إضافة اللوغو في صفحة CTA (h-16)
-   - تحديث جميع الألوان في `index.css` و `design_guidelines.md`
-
-6. **تحسينات نموذج الاستبيان | Survey Form Improvements**
-   - حقل "رقم الجلسة" إلزامي
-   - حقل "طبيعة المشكلة" اختياري
-   - تحديث schema و validation
-   - تكامل كامل مع API
-
-7. **تحسينات التسجيل | Recording Improvements**
-   - تغيير زر "إلغاء الجلسة" إلى "وقف التسجيل"
-   - إضافة وظيفة pause/resume
-   - عدم إرسال audio chunks أثناء الإيقاف المؤقت
-   - تحديث رسائل الحالة
-
-8. **الاختبار الشامل | Comprehensive Testing**
-   - اختبار e2e كامل عبر Playwright نجح بنسبة 100%
-   - التحقق من جميع المراحل: CTA → Consent → Privacy → Survey
-   - التحقق من الحقول الجديدة والألوان واللوغو
-   - معالجة صحيحة لحالات الأخطاء
-
----
-
-## البنية المعمارية للنظام | System Architecture
-
-### البنية الأمامية | Frontend Architecture
-
-**الإطار | Framework**: React with TypeScript, using Vite
-
-**نظام مكونات الواجهة | UI Component System**: 
-- Shadcn UI components (New York style) built on Radix UI
-- TailwindCSS with complete RTL (right-to-left) support
-- Custom Arabic-first design system (Cairo, IBM Plex Sans Arabic fonts)
-- Component aliases: @/components, @/lib, @/hooks
-
-**إدارة الحالة | State Management**:
-- React Hook Form + Zod validation for forms
-- TanStack Query for server state
-- Local component state for UI phases
-
-**مبادئ التصميم | Design Principles**:
-- نظام RTL كامل في جميع أنحاء التطبيق
-- لغة بصرية تعطي الأولوية للخصوصية
-- جماليات هادئة وموثوقة
-- إمكانية الوصول مع ARIA labels صحيحة
-
-### البنية الخلفية | Backend Architecture
-
-**إطار الخادم | Server Framework**: Express.js on Node.js
-
-**الاتصال في الوقت الفعلي | Real-time Communication**: 
-- WebSocket implementation using 'ws' library
-- Dedicated endpoint at `/ws` for audio streaming
-- Bi-directional communication with Google Speech API
-
-**تصميم API | API Design**:
-- `POST /api/sessions/init` - Create new session
-- `GET /api/sessions/:id` - Get session details
-- WebSocket `/ws?sessionId=<id>` - Real-time audio streaming
-
-**تدفق معالجة الصوت | Audio Processing Flow**:
-1. Client establishes WebSocket after consent/survey
-2. Browser captures audio via AudioWorklet (or ScriptProcessor fallback)
-3. Audio downsampled to 16kHz LINEAR16 PCM
-4. Chunks streamed to backend over WebSocket
-5. Backend forwards to Google Speech-to-Text with proper framing
-6. Transcription results sent back to client in real-time
-7. Final transcript saved to PostgreSQL database
-8. Auto-complete after 20 seconds of silence
-
-**استراتيجية تخزين البيانات | Data Storage Strategy**: 
-- PostgreSQL via Neon serverless + Drizzle ORM
-- Single `sessions` table (no audio files stored)
-- Schema: participant info, session metadata, transcript, status
-- Privacy by design - text only
-
-### الاعتماديات الخارجية | External Dependencies
-
-**Google Cloud Speech-to-Text API** (`@google-cloud/speech`):
-- Primary speech recognition service
-- LINEAR16 PCM encoding at 16kHz
-- Arabic language support (ar-SA, ar-AE, ar-EG)
-- Credentials: `GOOGLE_APPLICATION_CREDENTIALS_JSON` env variable
-- Critical dependency - app will not start without valid credentials
-
-**قاعدة البيانات | Database**: 
-- Neon Postgres via `@neondatabase/serverless`
-- Connection: `DATABASE_URL` environment variable
-- WebSocket-compatible PostgreSQL client
-- Drizzle Kit for schema management
-
-**اعتبارات النشر | Deployment Considerations**:
-- Required env vars: `DATABASE_URL`, `GOOGLE_APPLICATION_CREDENTIALS_JSON`
-- Build: Vite for frontend, esbuild for backend
-- Production: compiled code from `dist/` directory
-- Static assets from `dist/public`
-
----
-
-## مراحل التطبيق | Application Phases
-
-التطبيق يتكون من 4 مراحل متسلسلة (للمستشار):
-
-### 1. CTA (Call-to-Action)
-- الصفحة الترحيبية
-- شرح موجز للخدمة
-- زر "بدء جلسة جديدة" - يبدأ التسجيل مباشرة
-
-### 2. Recording (التسجيل)
-- خلفية سوداء كاملة
-- نقاط متحركة هادئة
-- حالة التسجيل: "جلستكم محمية وآمنة"
-- إمكانية إيقاف مؤقت / استئناف
-- زر "إنهاء الجلسة"
-- إنهاء تلقائي بعد 5 دقائق من الصمت
-
-### 3. Survey (تقييم الجلسة - للمستشار)
-بيانات الجلسة:
-- تاريخ الجلسة
-- عدد الأطراف (1-10)
-- نوع العلاقة (زوجان، أقارب، والد وابنه، أخرى)
-- وجود أطفال متأثرين (checkbox)
-- رقم الجلسة (الأولى، الثانية، الثالثة، أكثر من ثلاث)
-- طبيعة المشكلة (خلافات زوجية، أسرية، مالية، حضانة، أخرى)
-
-تقييم المستشار:
-- فعالية الجلسة (فعالة جداً، فعالة، متوسطة، غير فعالة)
-- تقدم المصالحة (تقدم ممتاز، تقدم جيد، تقدم ضعيف، لا يوجد تقدم)
-- ملاحظات المستشار (اختياري - حقل نصي)
-
-### 4. Done (الاكتمال)
-- رسالة شكر
-- أيقونة علامة صح
-- إعادة تعيين تلقائية بعد 5 ثوانٍ
-
----
-
-## الملفات الرئيسية | Key Files
-
-### Frontend
-- `client/src/pages/home.tsx` - المكون الرئيسي لجميع المراحل
-- `client/src/pages/privacy-policy.tsx` - صفحة سياسة الخصوصية
-- `client/src/pages/admin-login.tsx` - صفحة تسجيل دخول الإدارة
-- `client/src/pages/admin-sessions.tsx` - صفحة عرض الجلسات للإدارة
-- `client/public/audio-processor.js` - AudioWorklet لمعالجة الصوت
-- `client/src/lib/queryClient.ts` - إعداد TanStack Query
-
-### Backend
-- `server/routes.ts` - API endpoints + WebSocket handler + Admin endpoints
-- `server/storage.ts` - Database operations interface
-- `server/db.ts` - Drizzle ORM configuration
-
-### Shared
-- `shared/schema.ts` - Drizzle schema + Zod validation schemas
-
-### Design
-- `design_guidelines.md` - دليل التصميم الكامل
-- `tailwind.config.ts` - Tailwind configuration with RTL
-- `client/index.html` - Arabic fonts (Cairo, IBM Plex Sans Arabic)
-
----
-
-## المتغيرات البيئية المطلوبة | Required Environment Variables
-
-```bash
-DATABASE_URL=<Neon PostgreSQL connection string>
-GOOGLE_APPLICATION_CREDENTIALS_JSON=<Google Cloud Service Account JSON>
-SESSION_SECRET=<Random secret for session management>
-```
-
----
-
-## تشغيل التطبيق | Running the Application
-
-```bash
-# Development
-npm run dev
-
-# Build
-npm run build
-
-# Production
-npm start
-```
-
----
-
-## الخصوصية والأمان | Privacy & Security
-
-### ✅ Privacy Features
-- **No audio files stored** - only text transcripts
-- Clear consent flow with full disclosure
-- User can cancel recording anytime
-- Automatic session completion after silence
-
-### ✅ Security Measures
-- Google Cloud credentials stored in Replit Secrets
-- Database credentials in environment variables
-- No client-side storage of sensitive data
-- Server-side validation of all inputs
-
----
-
-## الاختبار | Testing
-
-تم اختبار التطبيق بالكامل باستخدام Playwright:
-- ✅ جميع المراحل (CTA → Consent → Survey → Recording → Done)
-- ✅ التحقق من صحة النماذج
-- ✅ معالجة الأخطاء (عدم توفر الميكروفون)
-- ✅ واجهة عربية RTL
-- ✅ زر الإلغاء في واجهة التسجيل
-
----
-
-## التحسينات المستقبلية | Future Enhancements
-
-1. **Operational Logging**
-   - Production-grade logging for recognition errors
-   - WebSocket lifecycle metrics
-   - Performance monitoring
-
-2. **Multi-Device Testing**
-   - Real-device smoke tests
-   - AudioWorklet fallback validation
-   - Cross-browser compatibility tests
-
-3. **Database Management**
-   - Migration scripts for production
-   - Backup and restore procedures
-   - Environment promotion strategy
-
----
+## Overview
+An Arabic-first, privacy-focused web application for recording and transcribing counseling/mediation sessions. The platform is designed for counselors to initiate sessions, record with real-time speech-to-text conversion, and then complete an evaluation survey. Crucially, no audio files are stored; only the transcribed text is saved for service improvement. The application emphasizes trust, privacy, and cultural sensitivity with a calm, professional design tailored for Arabic-speaking counselors. Key capabilities include a secure admin panel for session viewing and export, enhanced audio processing, and robust integration with Google Speech-to-Text for high-quality Arabic transcription. The user flow is streamlined: Call-to-Action -> Recording -> Survey -> Done.
 
 ## User Preferences
-
 Preferred communication style: Simple, everyday language (non-technical).
 
----
+## System Architecture
 
-**Created**: October 2025  
-**Last Updated**: October 29, 2025  
-**Status**: ✅ Production Ready
+### Frontend Architecture
+The frontend is built with React and TypeScript using Vite. It utilizes Shadcn UI components (New York style) based on Radix UI, styled with TailwindCSS and full RTL support. A custom Arabic-first design system incorporates Cairo and IBM Plex Sans Arabic fonts. State management uses React Hook Form with Zod for validation, and TanStack Query for server state. Design principles prioritize a full RTL system, privacy-focused visual language, calm aesthetics, and accessibility with correct ARIA labels.
+
+### Backend Architecture
+The backend is an Express.js application on Node.js. Real-time communication is handled via WebSockets using the `ws` library, specifically for audio streaming. The API design includes endpoints for session initialization and retrieval. The audio processing flow involves client-side audio capture and downsampling to 16kHz LINEAR16 PCM, streaming to the backend via WebSocket, forwarding to Google Speech-to-Text, and real-time transcription results sent back to the client. The final transcript is saved to a PostgreSQL database.
+
+### Data Storage Strategy
+PostgreSQL, managed by Neon serverless, is used with Drizzle ORM. A single `sessions` table stores participant information, session metadata, transcripts, and status, with no audio files ever being stored, adhering to a "privacy by design" principle.
+
+### UI/UX Decisions
+The application features a dark, calming aesthetic during recording, using new brand colors: Primary Orange (#E88F3A) and Secondary Turquoise (#1B9AAA). Arabic fonts (Cairo, IBM Plex Sans Arabic) are used throughout for an authentic Arabic-first experience. The user flow is structured into CTA, Recording, Survey (for counselors), and Done phases. The admin panel provides a secure, organized table view for sessions with CSV export.
+
+### Feature Specifications
+- **Real-time Transcription**: Converts spoken Arabic to text using Google Speech-to-Text.
+- **Privacy-focused**: No audio files are ever stored, only transcribed text.
+- **Counselor-centric Workflow**: Designed for counselors to manage sessions and evaluations.
+- **Admin Panel**: Secure access to view and export session data.
+- **Survey Integration**: Post-session survey for counselors to evaluate session effectiveness, reconciliation progress, and add notes.
+- **Audio Processing**: Enhanced client-side audio processing via AudioWorklet, with fallback for older browsers, downsampling to 16kHz LINEAR16 PCM.
+- **RTL Support**: Full right-to-left language support for the Arabic interface.
+- **Pause/Resume Recording**: Functionality to temporarily halt and restart recording.
+- **Auto-completion**: Sessions automatically end after 5 minutes of silence.
+
+## External Dependencies
+
+-   **Google Cloud Speech-to-Text API** (`@google-cloud/speech`): Primary speech recognition service for Arabic (ar-SA, ar-AE, ar-EG) using LINEAR16 PCM encoding at 16kHz. Requires `GOOGLE_APPLICATION_CREDENTIALS_JSON` environment variable.
+-   **Neon Postgres**: Serverless PostgreSQL database accessed via `@neondatabase/serverless` and managed with Drizzle Kit for schema. Requires `DATABASE_URL` environment variable.

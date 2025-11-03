@@ -323,25 +323,32 @@ export async function registerRoutes(app: Express): Promise<Server> {
           const transcript = result.alternatives[0].transcript;
           const detectedLang = result.languageCode || PRIMARY_LANG;
           
-          if (DEBUG) console.log(`Transcript (${detectedLang}, final=${result.isFinal}): ${transcript}`);
+          if (DEBUG) console.log(`Transcript (${detectedLang}, final=${result.isFinal}): "${transcript}"`);
           
           if (result.isFinal) {
-            accumulated += (accumulated ? " " : "") + transcript;
-            await storage
-              .updateSessionTranscript(sessionId, accumulated)
-              .catch((err) => {
-                console.error(`Failed to save transcript for session ${sessionId}:`, err);
-              });
-            console.log(`Saved final transcript. Total length: ${accumulated.length} characters`);
-            ws.send(
-              JSON.stringify({
-                type: "transcript",
-                text: transcript,
-                isFinal: true,
-              }),
-            );
-            resetSilenceTimer();
+            // Only process non-empty transcripts
+            const trimmedTranscript = transcript.trim();
+            if (trimmedTranscript.length > 0) {
+              accumulated += (accumulated ? " " : "") + trimmedTranscript;
+              await storage
+                .updateSessionTranscript(sessionId, accumulated)
+                .catch((err) => {
+                  console.error(`Failed to save transcript for session ${sessionId}:`, err);
+                });
+              console.log(`✓ Saved: "${trimmedTranscript}" | Total: ${accumulated.length} chars`);
+              ws.send(
+                JSON.stringify({
+                  type: "transcript",
+                  text: trimmedTranscript,
+                  isFinal: true,
+                }),
+              );
+              resetSilenceTimer();
+            } else {
+              if (DEBUG) console.log(`Skipped empty final transcript`);
+            }
           } else {
+            // Send interim results to frontend (even if empty for UI responsiveness)
             ws.send(
               JSON.stringify({
                 type: "transcript",

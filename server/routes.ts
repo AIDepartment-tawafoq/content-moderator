@@ -243,6 +243,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // ========== WebSocket Streaming STT ==========
 // ========== WebSocket Streaming STT (Production, >1hr) ==========
+// ========== WebSocket Streaming STT (Production, >1hr) ==========
 wss.on("connection", (ws: WebSocket, req) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
   const sessionId = url.searchParams.get("sessionId");
@@ -255,35 +256,42 @@ wss.on("connection", (ws: WebSocket, req) => {
   // ---- Tunables (safe defaults) ----
   const SAMPLE_RATE = 16000;             // 16kHz PCM mono
   const BYTES_PER_SAMPLE = 2;            // 16-bit
-  const SEGMENT_MS = 4 * 60 * 1000;      // 4:00 restart (well before Google's ~5:00 cutoff)
+  const SEGMENT_MS = 4 * 60 * 1000;      // 4:00 base segment length
+  const RESTART_BUFFER_MS = 5000;        // Safety margin: restart 5 seconds early
   const BRIDGE_SEC = 3;                  // bridge tail audio into next segment
   const MAX_BRIDGE = BRIDGE_SEC * SAMPLE_RATE * BYTES_PER_SAMPLE;
   const FLUSH_EVERY_MS = 30_000;         // periodic flush
   const SILENCE_TIMEOUT_MS = 5 * 60 * 1000; // end session if no final words this long
   const HEALTH_NO_DATA_MS = 45_000;      // watchdog restart if no data seen this long
   const MAX_BACKOFF_MS = 10_000;         // cap for exponential backoff
+  const STREAM_OVERLAP_MS = 500;         // How long old stream lives alongside new stream
 
   // ---- State ----
   let accumulated = "";
   let currentStream: any | null = null;
   let lastDataAt = Date.now();
-  let restarting = false;
-  let isPaused = false;
+  let streamStartedAt = Date.now();      // Track when the current stream was created
+  let restarting = false;                // Prevent concurrent restarts
+  let isPaused = false;                  // User-triggered pause state
+  let isClosing = false;                 // Shutdown flag to prevent restarts during cleanup
 
-  // rolling bridge buffer (last few seconds of audio)
+  // Rolling bridge buffer stores the last few seconds of audio
+  // This audio is replayed into each new stream to ensure continuity
   let bridgeBuffer: Buffer[] = [];
   let bridgeBytes = 0;
 
-  // timers
+  // Timers for various lifecycle management tasks
   let tSegment: NodeJS.Timeout | null = null;
   let tFlush: NodeJS.Timeout | null = null;
   let tSilence: NodeJS.Timeout | null = null;
   let tHealth: NodeJS.Timeout | null = null;
 
-  // backoff
+  // Exponential backoff for error recovery
   let backoffMs = 500;
 
   // ---- Utilities ----
+  
+  // Clear all active timers to prevent memory leaks and unexpected behavior
   const clearTimers = () => {
     if (tSegment) { clearTimeout(tSegment); tSegment = null; }
     if (tFlush) { clearInterval(tFlush); tFlush = null; }
@@ -291,9 +299,12 @@ wss.on("connection", (ws: WebSocket, req) => {
     if (tHealth) { clearInterval(tHealth); tHealth = null; }
   };
 
+  // Schedule automatic session completion after extended silence
+  // This only resets when we receive final transcript results, not on interim results
   const scheduleSilenceTimer = () => {
     if (tSilence) clearTimeout(tSilence);
     tSilence = setTimeout(async () => {
+      console.log('[silence] Timeout reached, completing session');
       await flushTranscript();
       await storage.completeSession(sessionId).catch(() => {});
       if (ws.readyState === WebSocket.OPEN) {
@@ -303,25 +314,29 @@ wss.on("connection", (ws: WebSocket, req) => {
     }, SILENCE_TIMEOUT_MS);
   };
 
+  // Persist the accumulated transcript to storage
   const flushTranscript = async () => {
     if (!accumulated) return;
     try {
       await storage.updateSessionTranscript(sessionId, accumulated);
-      // console.log(`[flush] ${accumulated.length} chars`);
+      console.log(`[flush] ${accumulated.length} chars persisted`);
     } catch (e) {
       console.error("Flush failed:", e);
     }
   };
 
+  // Start periodic background flushing to ensure data isn't lost
   const startPeriodicFlush = () => {
     if (tFlush) clearInterval(tFlush);
     tFlush = setInterval(flushTranscript, FLUSH_EVERY_MS);
   };
 
+  // Health watchdog detects when the stream stops receiving data
+  // This catches edge cases where Google silently stops sending data
   const startHealthWatchdog = () => {
     if (tHealth) clearInterval(tHealth);
     tHealth = setInterval(() => {
-      if (isPaused) return;
+      if (isPaused || isClosing) return;
       const idle = Date.now() - lastDataAt;
       if (idle > HEALTH_NO_DATA_MS) {
         console.warn(`[health] No data for ${idle}ms — forcing segment restart`);
@@ -330,26 +345,43 @@ wss.on("connection", (ws: WebSocket, req) => {
     }, Math.min(HEALTH_NO_DATA_MS, 15000));
   };
 
+  // Add audio chunk to the rolling bridge buffer
+  // This buffer maintains the last few seconds of audio for stream continuity
   const writeToBridge = (buf: Buffer) => {
     bridgeBuffer.push(buf);
     bridgeBytes += buf.length;
+    // Keep only the most recent BRIDGE_SEC seconds of audio
     while (bridgeBytes > MAX_BRIDGE) {
       const dropped = bridgeBuffer.shift();
       bridgeBytes -= dropped?.length || 0;
     }
   };
 
+  // Set up the segment restart timer with proper tracking
+  // This is critical: we restart BEFORE hitting Google's 5-minute limit
   const setSegmentTimer = () => {
     if (tSegment) clearTimeout(tSegment);
-    tSegment = setTimeout(() => safeSegmentRestart("scheduled"), SEGMENT_MS);
+    streamStartedAt = Date.now();  // Mark when this stream's lifecycle begins
+    
+    // Calculate safe restart time: base segment length minus safety buffer
+    const safeSegmentMs = SEGMENT_MS - RESTART_BUFFER_MS;
+    
+    tSegment = setTimeout(() => {
+      const actualAge = Date.now() - streamStartedAt;
+      console.log(`[segment] Scheduled restart triggered at ${actualAge}ms`);
+      safeSegmentRestart("scheduled");
+    }, safeSegmentMs);
   };
 
+  // Backoff management for error recovery
   const increaseBackoff = () => {
     backoffMs = Math.min(MAX_BACKOFF_MS, Math.ceil(backoffMs * 1.8));
   };
   const resetBackoff = () => { backoffMs = 500; };
 
   // ---- Stream wiring ----
+  
+  // Handle incoming transcription results from Google
   const onData = async (data: any) => {
     lastDataAt = Date.now();
     const result = data?.results?.[0];
@@ -358,20 +390,24 @@ wss.on("connection", (ws: WebSocket, req) => {
     if (!transcript) return;
 
     if (result.isFinal) {
+      // Final results are added to our accumulated transcript
       accumulated += (accumulated ? " " : "") + transcript;
-      await flushTranscript();                 // persist each final chunk
-      scheduleSilenceTimer();                  // only reset on final words
+      await flushTranscript();                 // Persist each final chunk immediately
+      scheduleSilenceTimer();                  // Only reset silence timer on final words
       ws.send(JSON.stringify({ type: "transcript", text: transcript, isFinal: true }));
     } else {
+      // Interim results are sent but not accumulated
       ws.send(JSON.stringify({ type: "transcript", text: transcript, isFinal: false }));
     }
   };
 
+  // Handle errors from Google's streaming API
   const onError = (err: any) => {
     const msg = err?.message || String(err);
     const code = err?.code;
     console.warn(`[stream error] code=${code} msg=${msg}`);
-    // Common termination markers from Google
+    
+    // Common termination markers from Google that indicate we need to restart
     if (
       code === 11 ||                                 // RESOURCE_EXHAUSTED / RST
       msg.includes("RST_STREAM") ||
@@ -383,11 +419,13 @@ wss.on("connection", (ws: WebSocket, req) => {
       setTimeout(() => safeSegmentRestart("error"), backoffMs);
       return;
     }
-    // Unknown errors: still try a restart
+    
+    // Unknown errors: still try a restart with backoff
     increaseBackoff();
     setTimeout(() => safeSegmentRestart("error"), backoffMs);
   };
 
+  // Create a new Google streaming recognition stream
   const createStream = () => {
     const request = {
       config: {
@@ -408,98 +446,187 @@ wss.on("connection", (ws: WebSocket, req) => {
     return stream;
   };
 
-  // Rolling (overlapped) segment restart
-  const safeSegmentRestart = async (reason: "scheduled" | "watchdog" | "error") => {
-    if (restarting || isPaused) return;
+  // Rolling (overlapped) segment restart - the core mechanism for >1hr sessions
+  // This creates a new stream before the old one hits Google's 5-minute limit
+  const safeSegmentRestart = async (reason: "scheduled" | "watchdog" | "error" | "safety") => {
+    // Block concurrent restarts to prevent race conditions
+    if (restarting || isPaused || isClosing) {
+      console.log(`[restart] Blocked: restarting=${restarting}, paused=${isPaused}, closing=${isClosing}`);
+      return;
+    }
+    
     restarting = true;
+    const restartStartTime = Date.now();
+    const streamAge = restartStartTime - streamStartedAt;
+    
     try {
-      await flushTranscript(); // make sure DB is up-to-date
+      console.log(`[restart] Reason: ${reason}, Stream age: ${streamAge}ms (${(streamAge/1000).toFixed(1)}s)`);
+      
+      // Ensure any pending transcript is saved before switching streams
+      await flushTranscript();
 
+      // Keep reference to old stream
       const oldStream = currentStream;
+      
+      // Create the new stream but don't assign it yet
       const newStream = createStream();
-      currentStream = newStream;
-
-      // Immediately re-feed the bridge tail into the new stream
+      
+      // Critical: Write bridge buffer to new stream BEFORE reassigning currentStream
+      // This ensures the new stream has context from recent audio
+      let bridgeWritten = 0;
       for (const chunk of bridgeBuffer) {
-        try { newStream.write(chunk); } catch { /* ignore */ }
+        try { 
+          newStream.write(chunk);
+          bridgeWritten += chunk.length;
+        } catch (e) { 
+          console.warn('[restart] Bridge write failed:', e);
+        }
       }
+      console.log(`[restart] Bridge: ${bridgeWritten} bytes (${(bridgeWritten / (SAMPLE_RATE * BYTES_PER_SAMPLE)).toFixed(2)}s) written to new stream`);
 
-      // small overlap window so the new stream is hot before closing old
-      setTimeout(() => {
-        try { oldStream && !oldStream.destroyed && oldStream.end(); } catch { /* ignore */ }
-      }, 1500);
-
-      // reschedule segment timer & health checks
+      // NOW reassign currentStream so incoming audio goes to the new stream
+      currentStream = newStream;
+      
+      // Reset the segment timer IMMEDIATELY for the new stream
+      // This is critical - the timer must start the moment the new stream becomes active
       setSegmentTimer();
+      
+      // Update lastDataAt so health watchdog doesn't false-trigger during transition
+      lastDataAt = Date.now();
+      
+      // End old stream gracefully after a brief overlap period
+      // This ensures no audio is lost during the transition
+      setTimeout(() => {
+        try { 
+          if (oldStream && !oldStream.destroyed) {
+            oldStream.end();
+            console.log('[restart] Old stream ended');
+          }
+        } catch (e) {
+          console.warn('[restart] Old stream end failed:', e);
+        }
+      }, STREAM_OVERLAP_MS);
+
       resetBackoff();
+      console.log(`[restart] Complete in ${Date.now() - restartStartTime}ms`);
+      
+    } catch (error) {
+      console.error('[restart] Failed:', error);
+      increaseBackoff();
     } finally {
       restarting = false;
     }
   };
 
   // ---- Lifecycle ----
+  
+  // Initialize the first stream and all monitoring systems
   const start = () => {
     currentStream = createStream();
+    streamStartedAt = Date.now();
     startPeriodicFlush();
     setSegmentTimer();
     scheduleSilenceTimer();
     startHealthWatchdog();
+    
+    console.log('[start] Initial stream created, session started');
   };
 
   start();
 
+  // Handle incoming WebSocket messages (both audio data and control commands)
   ws.on("message", (msg: Buffer | string) => {
     if (!currentStream || currentStream.destroyed || isPaused) return;
 
-    // control messages (JSON) are short; audio is binary or long buffers
+    // Safety check: Force restart if stream is dangerously close to 5-minute limit
+    // This acts as a last-ditch safety net in case the timer fails
+    const streamAge = Date.now() - streamStartedAt;
+    if (streamAge > SEGMENT_MS - 2000 && !restarting) {
+      console.warn(`[safety] Stream at ${streamAge}ms (${(streamAge/1000).toFixed(1)}s), forcing restart`);
+      safeSegmentRestart("safety");
+      // Don't return - still process this message after triggering restart
+    }
+
+    // Control messages are JSON (typically small)
+    // Audio data is binary (typically larger buffers)
     try {
       if (typeof msg === "string" || (Buffer.isBuffer(msg) && msg.length < 1024)) {
         const str = typeof msg === "string" ? msg : msg.toString("utf8");
         try {
           const cmd = JSON.parse(str);
+          
+          // Handle pause command
           if (cmd?.type === "pause") {
+            console.log('[pause] User requested pause');
             isPaused = true;
             clearTimers();
             try { currentStream && !currentStream.destroyed && currentStream.end(); } catch {}
             return;
           }
+          
+          // Handle resume command
           if (cmd?.type === "resume") {
+            console.log('[resume] User requested resume');
             isPaused = false;
-            // start fresh segment
             resetBackoff();
             currentStream = createStream();
+            streamStartedAt = Date.now();
             startPeriodicFlush();
             setSegmentTimer();
             scheduleSilenceTimer();
+            startHealthWatchdog();
             return;
           }
+          
+          // Handle manual restart command
           if (cmd?.type === "restart_segment") {
+            console.log('[manual] User requested segment restart');
             safeSegmentRestart("scheduled");
             return;
           }
-        } catch { /* not a control JSON */ }
+        } catch { 
+          /* not a control JSON, treat as audio data */ 
+        }
       }
-    } catch { /* ignore */ }
+    } catch { /* ignore parsing errors */ }
 
-    // audio data path
+    // Audio data path: write to current stream and update bridge buffer
     const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg as string);
-    try { currentStream.write(buf); } catch { /* stream might be closing; ignore */ }
+    try { 
+      currentStream.write(buf); 
+    } catch (e) { 
+      // Stream might be closing during restart; this is expected
+      // The next restart will create a fresh stream
+    }
     writeToBridge(buf);
-    // do NOT reset silence timer on raw audio — we only want to reset on final words
+    
+    // Note: We do NOT reset the silence timer here
+    // The silence timer only resets on final transcript results
   });
 
+  // Handle WebSocket closure
   ws.on("close", async () => {
+    console.log('[close] WebSocket closed, cleaning up');
+    isClosing = true;  // Prevent any restart attempts during shutdown
     clearTimers();
-    try { currentStream && !currentStream.destroyed && currentStream.end(); } catch {}
+    try { 
+      if (currentStream && !currentStream.destroyed) {
+        currentStream.end();
+        console.log('[close] Stream ended'); 
+      }
+    } catch (e) {
+      console.warn('[close] Stream end failed:', e);
+    }
     await flushTranscript();
     await storage.completeSession(sessionId).catch(() => {});
+    console.log('[close] Session completed');
   });
 
+  // Handle WebSocket errors
   ws.on("error", (err) => {
-    console.error("WebSocket error:", err);
+    console.error("[websocket error]", err);
   });
 });
-
   
   return httpServer;
 }

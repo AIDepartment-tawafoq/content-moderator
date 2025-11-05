@@ -242,7 +242,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // ========== WebSocket Streaming STT ==========
-  // ========== WebSocket Streaming STT ==========
   wss.on("connection", (ws: WebSocket, req) => {
     const url = new URL(req.url || "", `http://${req.headers.host}`);
     const sessionId = url.searchParams.get("sessionId");
@@ -256,26 +255,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
     // ---- Constants ----
     const SILENCE_TIMEOUT = 5 * 60 * 1000; // 5 min
     const STREAM_RESTART_INTERVAL = 4.5 * 60 * 1000; // restart before Google's limit
-    const BRIDGE_DURATION_SEC = 3; // keep 3 seconds of audio for bridging
+    const BRIDGE_DURATION_SEC = 3; // seconds of audio to bridge
     const SAMPLE_RATE = 16000;
     const BYTES_PER_SAMPLE = 2; // 16-bit PCM
     const MAX_BRIDGE_SIZE =
       BRIDGE_DURATION_SEC * SAMPLE_RATE * BYTES_PER_SAMPLE;
+    const FLUSH_INTERVAL = 30000; // 30 s periodic flush
 
     // ---- State ----
     let accumulated = "";
     let recognizeStream: any = null;
     let silenceTimer: NodeJS.Timeout | null = null;
     let streamRestartTimer: NodeJS.Timeout | null = null;
+    let flushTimer: NodeJS.Timeout | null = null;
     let isPaused = false;
     let bridgeBuffer: Buffer[] = [];
     let bridgeBytes = 0;
 
-    // ---- Helpers ----
+    // ---- Helper functions ----
     const resetSilenceTimer = () => {
       if (silenceTimer) clearTimeout(silenceTimer);
       silenceTimer = setTimeout(async () => {
         console.log(`Silence timeout for session ${sessionId}`);
+        await flushTranscript(); // ensure latest text is saved
         await storage.completeSession(sessionId).catch(() => {});
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
@@ -292,6 +294,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const cleanupTimers = () => {
       if (silenceTimer) clearTimeout(silenceTimer);
       if (streamRestartTimer) clearTimeout(streamRestartTimer);
+      if (flushTimer) clearInterval(flushTimer);
+    };
+
+    const flushTranscript = async () => {
+      if (!accumulated) return;
+      try {
+        await storage.updateSessionTranscript(sessionId, accumulated);
+        console.log(`✓ Flushed transcript (${accumulated.length} chars)`);
+      } catch (err) {
+        console.error("⚠️ Failed to flush transcript:", err);
+      }
+    };
+
+    const startPeriodicFlush = () => {
+      if (flushTimer) clearInterval(flushTimer);
+      flushTimer = setInterval(() => flushTranscript(), FLUSH_INTERVAL);
     };
 
     const startRecognitionStream = () => {
@@ -325,16 +343,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .on("data", async (data: any) => {
           const result = data.results?.[0];
           if (!result || !result.alternatives?.length) return;
-
           const transcript = result.alternatives[0].transcript.trim();
-          const isFinal = result.isFinal;
           if (!transcript) return;
 
-          if (isFinal) {
+          if (result.isFinal) {
             accumulated += (accumulated ? " " : "") + transcript;
-            await storage
-              .updateSessionTranscript(sessionId, accumulated)
-              .catch(() => {});
+            await flushTranscript(); // save each final chunk
             ws.send(
               JSON.stringify({
                 type: "transcript",
@@ -362,20 +376,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }, STREAM_RESTART_INTERVAL);
     };
 
-    const restartRecognitionStream = () => {
+    const restartRecognitionStream = async () => {
       console.log(`Restarting STT stream for session ${sessionId}`);
+      await flushTranscript(); // ✅ ensure DB has latest text
       if (recognizeStream && !recognizeStream.destroyed) recognizeStream.end();
 
       startRecognitionStream();
 
-      // Send last few seconds of audio to maintain context
-      for (const chunk of bridgeBuffer) {
-        recognizeStream.write(chunk);
-      }
+      // feed the last few seconds of audio into new stream
+      for (const chunk of bridgeBuffer) recognizeStream.write(chunk);
     };
 
-    // ---- WebSocket Events ----
+    // ---- WebSocket lifecycle ----
     startRecognitionStream();
+    startPeriodicFlush();
     resetSilenceTimer();
 
     ws.on("message", (msg: Buffer | string) => {
@@ -383,7 +397,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       try {
         const str = typeof msg === "string" ? msg : msg.toString("utf8");
         if (str.length < 1000) {
-          // handle control messages
           try {
             const cmd = JSON.parse(str);
             if (cmd.type === "pause") {
@@ -396,18 +409,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
             if (cmd.type === "resume") {
               isPaused = false;
               startRecognitionStream();
+              startPeriodicFlush();
               resetSilenceTimer();
               return;
             }
           } catch (_) {}
         }
 
-        // Handle audio data
+        // handle binary audio
         const buffer = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
         recognizeStream.write(buffer);
         resetSilenceTimer();
 
-        // Keep a rolling 3-second buffer for bridging
+        // maintain 3-second rolling buffer
         bridgeBuffer.push(buffer);
         bridgeBytes += buffer.length;
         while (bridgeBytes > MAX_BRIDGE_SIZE) {
@@ -422,10 +436,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     ws.on("close", async () => {
       cleanupTimers();
       if (recognizeStream && !recognizeStream.destroyed) recognizeStream.end();
-      if (accumulated)
-        await storage
-          .updateSessionTranscript(sessionId, accumulated)
-          .catch(() => {});
+      await flushTranscript();
       await storage.completeSession(sessionId).catch(() => {});
     });
 

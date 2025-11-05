@@ -79,7 +79,9 @@ const LANGUAGES = (process.env.STT_LANGS || "ar-SA,ar-EG,ar-AE")
   .split(",")
   .map((x) => x.trim());
 const PRIMARY_LANG = LANGUAGES[0] || "ar-SA";
-const ALT_LANGS = LANGUAGES.slice(1, 3).filter(lang => lang.startsWith('ar-'));
+const ALT_LANGS = LANGUAGES.slice(1, 3).filter((lang) =>
+  lang.startsWith("ar-"),
+);
 
 // Endpoint selection
 let apiEndpoint = "speech.googleapis.com";
@@ -240,26 +242,36 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // ========== WebSocket Streaming STT ==========
+  // ========== WebSocket Streaming STT ==========
   wss.on("connection", (ws: WebSocket, req) => {
     const url = new URL(req.url || "", `http://${req.headers.host}`);
     const sessionId = url.searchParams.get("sessionId");
     if (!sessionId) return ws.close(1008, "Missing sessionId");
 
     if (!speechClient) {
-      ws.send(
-        JSON.stringify({ type: "error", message: "STT service unavailable" }),
-      );
+      ws.send(JSON.stringify({ type: "error", message: "STT unavailable" }));
       return ws.close();
     }
 
-    const SILENCE_TIMEOUT = 300000; // 5min
-    const STREAM_RESTART_INTERVAL = 270000; // 4.5min - restart before Google's 5min limit
+    // ---- Constants ----
+    const SILENCE_TIMEOUT = 5 * 60 * 1000; // 5 min
+    const STREAM_RESTART_INTERVAL = 4.5 * 60 * 1000; // restart before Google's limit
+    const BRIDGE_DURATION_SEC = 3; // keep 3 seconds of audio for bridging
+    const SAMPLE_RATE = 16000;
+    const BYTES_PER_SAMPLE = 2; // 16-bit PCM
+    const MAX_BRIDGE_SIZE =
+      BRIDGE_DURATION_SEC * SAMPLE_RATE * BYTES_PER_SAMPLE;
+
+    // ---- State ----
     let accumulated = "";
     let recognizeStream: any = null;
     let silenceTimer: NodeJS.Timeout | null = null;
     let streamRestartTimer: NodeJS.Timeout | null = null;
     let isPaused = false;
+    let bridgeBuffer: Buffer[] = [];
+    let bridgeBytes = 0;
 
+    // ---- Helpers ----
     const resetSilenceTimer = () => {
       if (silenceTimer) clearTimeout(silenceTimer);
       silenceTimer = setTimeout(async () => {
@@ -277,78 +289,61 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }, SILENCE_TIMEOUT);
     };
 
-    const restartRecognitionStream = () => {
-      console.log(`Restarting recognition stream for session ${sessionId} to handle long duration`);
-      if (recognizeStream && !recognizeStream.destroyed) {
-        recognizeStream.end();
-      }
-      startRecognitionStream();
+    const cleanupTimers = () => {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      if (streamRestartTimer) clearTimeout(streamRestartTimer);
     };
 
     const startRecognitionStream = () => {
-      console.log(`Starting recognition stream for session ${sessionId} with language: ${PRIMARY_LANG}`);
-      
+      console.log(`(Re)starting recognition stream for ${sessionId}`);
+
       const request = {
         config: {
-          encoding: "LINEAR16" as const,
-          sampleRateHertz: 16000,
+          encoding: "LINEAR16",
+          sampleRateHertz: SAMPLE_RATE,
           languageCode: PRIMARY_LANG,
           alternativeLanguageCodes: ALT_LANGS,
           enableAutomaticPunctuation: true,
-          model: "latest_long", // Always use long model for better accuracy
+          model: "latest_long",
           useEnhanced: true,
           singleUtterance: false,
         },
         interimResults: true,
       };
 
-      console.log(`Recognition config:`, JSON.stringify(request.config, null, 2));
-
       recognizeStream = speechClient!
         .streamingRecognize(request)
         .on("error", (err: any) => {
-          console.error(`Speech recognition error for session ${sessionId}:`, err.message);
-          if (ws.readyState === WebSocket.OPEN)
-            ws.send(
-              JSON.stringify({
-                type: "error",
-                message: "خطأ في التحويل الصوتي",
-              }),
-            );
+          console.error("STT stream error:", err.message);
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message: "Speech recognition error",
+            }),
+          );
         })
         .on("data", async (data: any) => {
           const result = data.results?.[0];
           if (!result || !result.alternatives?.length) return;
 
-          const transcript = result.alternatives[0].transcript;
-          const detectedLang = result.languageCode || PRIMARY_LANG;
-          
-          if (DEBUG) console.log(`Transcript (${detectedLang}, final=${result.isFinal}): "${transcript}"`);
-          
-          if (result.isFinal) {
-            // Only process non-empty transcripts
-            const trimmedTranscript = transcript.trim();
-            if (trimmedTranscript.length > 0) {
-              accumulated += (accumulated ? " " : "") + trimmedTranscript;
-              await storage
-                .updateSessionTranscript(sessionId, accumulated)
-                .catch((err) => {
-                  console.error(`Failed to save transcript for session ${sessionId}:`, err);
-                });
-              console.log(`✓ Saved: "${trimmedTranscript}" | Total: ${accumulated.length} chars`);
-              ws.send(
-                JSON.stringify({
-                  type: "transcript",
-                  text: trimmedTranscript,
-                  isFinal: true,
-                }),
-              );
-              resetSilenceTimer();
-            } else {
-              if (DEBUG) console.log(`Skipped empty final transcript`);
-            }
+          const transcript = result.alternatives[0].transcript.trim();
+          const isFinal = result.isFinal;
+          if (!transcript) return;
+
+          if (isFinal) {
+            accumulated += (accumulated ? " " : "") + transcript;
+            await storage
+              .updateSessionTranscript(sessionId, accumulated)
+              .catch(() => {});
+            ws.send(
+              JSON.stringify({
+                type: "transcript",
+                text: transcript,
+                isFinal: true,
+              }),
+            );
+            resetSilenceTimer();
           } else {
-            // Send interim results to frontend (even if empty for UI responsiveness)
             ws.send(
               JSON.stringify({
                 type: "transcript",
@@ -359,31 +354,43 @@ export async function registerRoutes(app: Express): Promise<Server> {
           }
         });
 
-      // Set up automatic stream restart before hitting Google's limit
+      // restart before hitting 5 min limit
       if (streamRestartTimer) clearTimeout(streamRestartTimer);
       streamRestartTimer = setTimeout(() => {
-        if (!isPaused && ws.readyState === WebSocket.OPEN) {
-          console.log(`Auto-restarting stream for session ${sessionId} after ${STREAM_RESTART_INTERVAL/1000} seconds`);
+        if (!isPaused && ws.readyState === WebSocket.OPEN)
           restartRecognitionStream();
-        }
       }, STREAM_RESTART_INTERVAL);
     };
 
+    const restartRecognitionStream = () => {
+      console.log(`Restarting STT stream for session ${sessionId}`);
+      if (recognizeStream && !recognizeStream.destroyed) recognizeStream.end();
+
+      startRecognitionStream();
+
+      // Send last few seconds of audio to maintain context
+      for (const chunk of bridgeBuffer) {
+        recognizeStream.write(chunk);
+      }
+    };
+
+    // ---- WebSocket Events ----
     startRecognitionStream();
     resetSilenceTimer();
 
     ws.on("message", (msg: Buffer | string) => {
-      if (!recognizeStream || recognizeStream.destroyed) return;
+      if (!recognizeStream || recognizeStream.destroyed || isPaused) return;
       try {
         const str = typeof msg === "string" ? msg : msg.toString("utf8");
         if (str.length < 1000) {
+          // handle control messages
           try {
             const cmd = JSON.parse(str);
             if (cmd.type === "pause") {
               isPaused = true;
-              if (streamRestartTimer) clearTimeout(streamRestartTimer);
-              recognizeStream.end();
-              recognizeStream = null;
+              cleanupTimers();
+              if (recognizeStream && !recognizeStream.destroyed)
+                recognizeStream.end();
               return;
             }
             if (cmd.type === "resume") {
@@ -394,19 +401,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
             }
           } catch (_) {}
         }
-        if (!isPaused) {
-          const buffer = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-          recognizeStream.write(buffer);
-          resetSilenceTimer();
+
+        // Handle audio data
+        const buffer = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
+        recognizeStream.write(buffer);
+        resetSilenceTimer();
+
+        // Keep a rolling 3-second buffer for bridging
+        bridgeBuffer.push(buffer);
+        bridgeBytes += buffer.length;
+        while (bridgeBytes > MAX_BRIDGE_SIZE) {
+          const removed = bridgeBuffer.shift();
+          bridgeBytes -= removed?.length ?? 0;
         }
       } catch (err) {
-        console.error("Error handling message:", err);
+        console.error("Error processing audio chunk:", err);
       }
     });
 
     ws.on("close", async () => {
-      if (silenceTimer) clearTimeout(silenceTimer);
-      if (streamRestartTimer) clearTimeout(streamRestartTimer);
+      cleanupTimers();
       if (recognizeStream && !recognizeStream.destroyed) recognizeStream.end();
       if (accumulated)
         await storage

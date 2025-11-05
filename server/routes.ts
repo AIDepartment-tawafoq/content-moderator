@@ -242,79 +242,156 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // ========== WebSocket Streaming STT ==========
+// ========== WebSocket Streaming STT (Production, >1hr) ==========
 wss.on("connection", (ws: WebSocket, req) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
   const sessionId = url.searchParams.get("sessionId");
   if (!sessionId) return ws.close(1008, "Missing sessionId");
-
   if (!speechClient) {
     ws.send(JSON.stringify({ type: "error", message: "STT unavailable" }));
     return ws.close();
   }
 
-  // ---- Constants ----
-  const SILENCE_TIMEOUT = 5 * 60 * 1000; // 5 min
-  const STREAM_RESTART_INTERVAL = 4.5 * 60 * 1000; // restart before Google 5-min cutoff
-  const BRIDGE_DURATION_SEC = 3; // seconds of audio bridging
-  const SAMPLE_RATE = 16000;
-  const BYTES_PER_SAMPLE = 2; // 16-bit PCM
-  const MAX_BRIDGE_SIZE = BRIDGE_DURATION_SEC * SAMPLE_RATE * BYTES_PER_SAMPLE;
-  const FLUSH_INTERVAL = 30000; // 30 s periodic flush
+  // ---- Tunables (safe defaults) ----
+  const SAMPLE_RATE = 16000;             // 16kHz PCM mono
+  const BYTES_PER_SAMPLE = 2;            // 16-bit
+  const SEGMENT_MS = 4 * 60 * 1000;      // 4:00 restart (well before Google's ~5:00 cutoff)
+  const BRIDGE_SEC = 3;                  // bridge tail audio into next segment
+  const MAX_BRIDGE = BRIDGE_SEC * SAMPLE_RATE * BYTES_PER_SAMPLE;
+  const FLUSH_EVERY_MS = 30_000;         // periodic flush
+  const SILENCE_TIMEOUT_MS = 5 * 60 * 1000; // end session if no final words this long
+  const HEALTH_NO_DATA_MS = 45_000;      // watchdog restart if no data seen this long
+  const MAX_BACKOFF_MS = 10_000;         // cap for exponential backoff
 
   // ---- State ----
   let accumulated = "";
-  let recognizeStream: any = null;
-  let silenceTimer: NodeJS.Timeout | null = null;
-  let streamRestartTimer: NodeJS.Timeout | null = null;
-  let flushTimer: NodeJS.Timeout | null = null;
-  let isPaused = false;
+  let currentStream: any | null = null;
+  let lastDataAt = Date.now();
   let restarting = false;
+  let isPaused = false;
+
+  // rolling bridge buffer (last few seconds of audio)
   let bridgeBuffer: Buffer[] = [];
   let bridgeBytes = 0;
 
-  // ---- Helpers ----
-  const flushTranscript = async () => {
-    if (!accumulated) return;
-    try {
-      await storage.updateSessionTranscript(sessionId, accumulated);
-      console.log(`✓ Flushed transcript (${accumulated.length} chars)`);
-    } catch (err) {
-      console.error("⚠️ Failed to flush transcript:", err);
-    }
+  // timers
+  let tSegment: NodeJS.Timeout | null = null;
+  let tFlush: NodeJS.Timeout | null = null;
+  let tSilence: NodeJS.Timeout | null = null;
+  let tHealth: NodeJS.Timeout | null = null;
+
+  // backoff
+  let backoffMs = 500;
+
+  // ---- Utilities ----
+  const clearTimers = () => {
+    if (tSegment) { clearTimeout(tSegment); tSegment = null; }
+    if (tFlush) { clearInterval(tFlush); tFlush = null; }
+    if (tSilence) { clearTimeout(tSilence); tSilence = null; }
+    if (tHealth) { clearInterval(tHealth); tHealth = null; }
   };
 
-  const resetSilenceTimer = () => {
-    if (silenceTimer) clearTimeout(silenceTimer);
-    silenceTimer = setTimeout(async () => {
-      console.log(`Silence timeout for session ${sessionId}`);
+  const scheduleSilenceTimer = () => {
+    if (tSilence) clearTimeout(tSilence);
+    tSilence = setTimeout(async () => {
       await flushTranscript();
       await storage.completeSession(sessionId).catch(() => {});
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "session_complete", transcript: accumulated }));
         ws.close(1000, "Silence timeout");
       }
-    }, SILENCE_TIMEOUT);
+    }, SILENCE_TIMEOUT_MS);
   };
 
-  const cleanupTimers = () => {
-    if (silenceTimer) clearTimeout(silenceTimer);
-    if (streamRestartTimer) clearTimeout(streamRestartTimer);
-    if (flushTimer) clearInterval(flushTimer);
+  const flushTranscript = async () => {
+    if (!accumulated) return;
+    try {
+      await storage.updateSessionTranscript(sessionId, accumulated);
+      // console.log(`[flush] ${accumulated.length} chars`);
+    } catch (e) {
+      console.error("Flush failed:", e);
+    }
   };
 
   const startPeriodicFlush = () => {
-    if (flushTimer) clearInterval(flushTimer);
-    flushTimer = setInterval(() => flushTranscript(), FLUSH_INTERVAL);
+    if (tFlush) clearInterval(tFlush);
+    tFlush = setInterval(flushTranscript, FLUSH_EVERY_MS);
   };
 
-  // ---- Core Stream Logic ----
-  const startRecognitionStream = () => {
-    if (restarting) return;
-    console.log(`(Re)starting recognition stream for ${sessionId}`);
+  const startHealthWatchdog = () => {
+    if (tHealth) clearInterval(tHealth);
+    tHealth = setInterval(() => {
+      if (isPaused) return;
+      const idle = Date.now() - lastDataAt;
+      if (idle > HEALTH_NO_DATA_MS) {
+        console.warn(`[health] No data for ${idle}ms — forcing segment restart`);
+        safeSegmentRestart("watchdog");
+      }
+    }, Math.min(HEALTH_NO_DATA_MS, 15000));
+  };
 
+  const writeToBridge = (buf: Buffer) => {
+    bridgeBuffer.push(buf);
+    bridgeBytes += buf.length;
+    while (bridgeBytes > MAX_BRIDGE) {
+      const dropped = bridgeBuffer.shift();
+      bridgeBytes -= dropped?.length || 0;
+    }
+  };
+
+  const setSegmentTimer = () => {
+    if (tSegment) clearTimeout(tSegment);
+    tSegment = setTimeout(() => safeSegmentRestart("scheduled"), SEGMENT_MS);
+  };
+
+  const increaseBackoff = () => {
+    backoffMs = Math.min(MAX_BACKOFF_MS, Math.ceil(backoffMs * 1.8));
+  };
+  const resetBackoff = () => { backoffMs = 500; };
+
+  // ---- Stream wiring ----
+  const onData = async (data: any) => {
+    lastDataAt = Date.now();
+    const result = data?.results?.[0];
+    if (!result || !result.alternatives?.length) return;
+    const transcript = (result.alternatives[0].transcript || "").trim();
+    if (!transcript) return;
+
+    if (result.isFinal) {
+      accumulated += (accumulated ? " " : "") + transcript;
+      await flushTranscript();                 // persist each final chunk
+      scheduleSilenceTimer();                  // only reset on final words
+      ws.send(JSON.stringify({ type: "transcript", text: transcript, isFinal: true }));
+    } else {
+      ws.send(JSON.stringify({ type: "transcript", text: transcript, isFinal: false }));
+    }
+  };
+
+  const onError = (err: any) => {
+    const msg = err?.message || String(err);
+    const code = err?.code;
+    console.warn(`[stream error] code=${code} msg=${msg}`);
+    // Common termination markers from Google
+    if (
+      code === 11 ||                                 // RESOURCE_EXHAUSTED / RST
+      msg.includes("RST_STREAM") ||
+      msg.includes("INTERNAL") ||
+      msg.includes("No status received") ||
+      msg.includes("GOAWAY")
+    ) {
+      increaseBackoff();
+      setTimeout(() => safeSegmentRestart("error"), backoffMs);
+      return;
+    }
+    // Unknown errors: still try a restart
+    increaseBackoff();
+    setTimeout(() => safeSegmentRestart("error"), backoffMs);
+  };
+
+  const createStream = () => {
     const request = {
       config: {
-        encoding: "LINEAR16",
+        encoding: "LINEAR16" as const,
         sampleRateHertz: SAMPLE_RATE,
         languageCode: PRIMARY_LANG,
         alternativeLanguageCodes: ALT_LANGS,
@@ -325,150 +402,104 @@ wss.on("connection", (ws: WebSocket, req) => {
       },
       interimResults: true,
     };
-
-    recognizeStream = speechClient!
-      .streamingRecognize(request)
-      .on("error", (err: any) => {
-        if (err.code === 11 || err.message?.includes("RST_STREAM")) {
-          console.warn("Google closed stream; restarting...");
-          restartRecognitionStream(true);
-          return;
-        }
-        console.error("STT stream error:", err.message);
-        ws.send(JSON.stringify({ type: "error", message: "Speech recognition error" }));
-      })
-      .on("data", async (data: any) => {
-        const result = data.results?.[0];
-        if (!result || !result.alternatives?.length) return;
-        const transcript = result.alternatives[0].transcript.trim();
-        if (!transcript) return;
-
-        if (result.isFinal) {
-          accumulated += (accumulated ? " " : "") + transcript;
-          await flushTranscript();
-          ws.send(JSON.stringify({ type: "transcript", text: transcript, isFinal: true }));
-          resetSilenceTimer();
-        } else {
-          ws.send(JSON.stringify({ type: "transcript", text: transcript, isFinal: false }));
-        }
-      });
-
-    // proactively restart before 5-min cutoff
-    if (streamRestartTimer) clearTimeout(streamRestartTimer);
-    streamRestartTimer = setTimeout(() => {
-      if (!isPaused && ws.readyState === WebSocket.OPEN) restartRecognitionStream(false);
-    }, STREAM_RESTART_INTERVAL);
+    const stream = speechClient!.streamingRecognize(request);
+    stream.on("error", onError);
+    stream.on("data", onData);
+    return stream;
   };
 
-  const restartRecognitionStream = async (dueToError: boolean) => {
-    if (restarting) return;
+  // Rolling (overlapped) segment restart
+  const safeSegmentRestart = async (reason: "scheduled" | "watchdog" | "error") => {
+    if (restarting || isPaused) return;
     restarting = true;
-    console.log(`Rolling restart of STT stream for session ${sessionId}`);
+    try {
+      await flushTranscript(); // make sure DB is up-to-date
 
-    await flushTranscript();
+      const oldStream = currentStream;
+      const newStream = createStream();
+      currentStream = newStream;
 
-    const oldStream = recognizeStream;
-    const newStream = speechClient!.streamingRecognize({
-      config: {
-        encoding: "LINEAR16",
-        sampleRateHertz: SAMPLE_RATE,
-        languageCode: PRIMARY_LANG,
-        alternativeLanguageCodes: ALT_LANGS,
-        enableAutomaticPunctuation: true,
-        model: "latest_long",
-        useEnhanced: true,
-        singleUtterance: false,
-      },
-      interimResults: true,
-    });
-
-    // reuse handlers
-    newStream.on("error", (err: any) => {
-      console.error("New STT stream error:", err.message);
-    });
-
-    newStream.on("data", oldStream.listeners("data")[0]);
-
-    recognizeStream = newStream;
-
-    // feed last few seconds of buffered audio
-    for (const chunk of bridgeBuffer) {
-      try {
-        recognizeStream.write(chunk);
-      } catch (e) {
-        console.warn("Bridge write failed:", e.message);
+      // Immediately re-feed the bridge tail into the new stream
+      for (const chunk of bridgeBuffer) {
+        try { newStream.write(chunk); } catch { /* ignore */ }
       }
-    }
 
-    // delay closing old stream to ensure smooth handoff
-    setTimeout(() => {
-      try {
-        if (oldStream && !oldStream.destroyed) oldStream.end();
-      } catch (_) {}
+      // small overlap window so the new stream is hot before closing old
+      setTimeout(() => {
+        try { oldStream && !oldStream.destroyed && oldStream.end(); } catch { /* ignore */ }
+      }, 1500);
+
+      // reschedule segment timer & health checks
+      setSegmentTimer();
+      resetBackoff();
+    } finally {
       restarting = false;
-    }, 2000);
-
-    // reschedule restart timer
-    if (streamRestartTimer) clearTimeout(streamRestartTimer);
-    streamRestartTimer = setTimeout(() => {
-      if (!isPaused && ws.readyState === WebSocket.OPEN) restartRecognitionStream(false);
-    }, STREAM_RESTART_INTERVAL);
+    }
   };
 
-  // ---- WebSocket Lifecycle ----
-  startRecognitionStream();
-  startPeriodicFlush();
-  resetSilenceTimer();
+  // ---- Lifecycle ----
+  const start = () => {
+    currentStream = createStream();
+    startPeriodicFlush();
+    setSegmentTimer();
+    scheduleSilenceTimer();
+    startHealthWatchdog();
+  };
+
+  start();
 
   ws.on("message", (msg: Buffer | string) => {
-    if (!recognizeStream || recognizeStream.destroyed || isPaused) return;
+    if (!currentStream || currentStream.destroyed || isPaused) return;
+
+    // control messages (JSON) are short; audio is binary or long buffers
     try {
-      const str = typeof msg === "string" ? msg : msg.toString("utf8");
-      if (str.length < 1000) {
+      if (typeof msg === "string" || (Buffer.isBuffer(msg) && msg.length < 1024)) {
+        const str = typeof msg === "string" ? msg : msg.toString("utf8");
         try {
           const cmd = JSON.parse(str);
-          if (cmd.type === "pause") {
+          if (cmd?.type === "pause") {
             isPaused = true;
-            cleanupTimers();
-            if (recognizeStream && !recognizeStream.destroyed) recognizeStream.end();
+            clearTimers();
+            try { currentStream && !currentStream.destroyed && currentStream.end(); } catch {}
             return;
           }
-          if (cmd.type === "resume") {
+          if (cmd?.type === "resume") {
             isPaused = false;
-            startRecognitionStream();
+            // start fresh segment
+            resetBackoff();
+            currentStream = createStream();
             startPeriodicFlush();
-            resetSilenceTimer();
+            setSegmentTimer();
+            scheduleSilenceTimer();
             return;
           }
-        } catch (_) {}
+          if (cmd?.type === "restart_segment") {
+            safeSegmentRestart("scheduled");
+            return;
+          }
+        } catch { /* not a control JSON */ }
       }
+    } catch { /* ignore */ }
 
-      // audio data handling
-      const buffer = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-      recognizeStream.write(buffer);
-      resetSilenceTimer();
-
-      // maintain 3-sec rolling buffer
-      bridgeBuffer.push(buffer);
-      bridgeBytes += buffer.length;
-      while (bridgeBytes > MAX_BRIDGE_SIZE) {
-        const removed = bridgeBuffer.shift();
-        bridgeBytes -= removed?.length ?? 0;
-      }
-    } catch (err) {
-      console.error("Error processing audio chunk:", err);
-    }
+    // audio data path
+    const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg as string);
+    try { currentStream.write(buf); } catch { /* stream might be closing; ignore */ }
+    writeToBridge(buf);
+    // do NOT reset silence timer on raw audio — we only want to reset on final words
   });
 
   ws.on("close", async () => {
-    cleanupTimers();
-    if (recognizeStream && !recognizeStream.destroyed) recognizeStream.end();
+    clearTimers();
+    try { currentStream && !currentStream.destroyed && currentStream.end(); } catch {}
     await flushTranscript();
     await storage.completeSession(sessionId).catch(() => {});
   });
 
-  ws.on("error", (err) => console.error("WebSocket error:", err));
+  ws.on("error", (err) => {
+    console.error("WebSocket error:", err);
+  });
 });
 
+  
   return httpServer;
 }

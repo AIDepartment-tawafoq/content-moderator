@@ -220,7 +220,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return ws.close();
     }
 
-    console.log(`[session ${sessionId}] WebSocket connected`);
+    console.log(`\n[session ${sessionId}] ===== WEBSOCKET CONNECTED =====`);
+    console.log(`[session ${sessionId}] Session ID: ${sessionId}`);
+    console.log(
+      `[session ${sessionId}] API Key configured: ${SPEECHMATICS_API_KEY ? "Yes (length: " + SPEECHMATICS_API_KEY.length + ")" : "No"}`,
+    );
+    console.log(
+      `[session ${sessionId}] Language: ${LANGUAGE} (${LANGUAGE_VARIANT})`,
+    );
+    console.log(
+      `[session ${sessionId}] ====================================\n`,
+    );
 
     // ---- Tunables (safe defaults) ----
     // Speechmatics doesn't have a 5-minute limit, but we restart periodically for reliability
@@ -435,10 +445,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     // Handle incoming transcription results from Speechmatics
     const onData = async (data: any, sourceStream?: any) => {
-      // Ignore data from old streams
-      if (sourceStream && sourceStream !== currentStream) {
+      // Ignore data from old streams (but allow if currentStream not set yet during initialization)
+      if (sourceStream && currentStream && sourceStream !== currentStream) {
         if (DEBUG)
           console.log(`[session ${sessionId}] Ignoring data from old stream`);
+        return;
+      }
+
+      // If currentStream is not set, this is likely during initialization - log but don't process yet
+      if (!currentStream) {
+        if (DEBUG)
+          console.log(
+            `[session ${sessionId}] Received data before stream ready, ignoring`,
+          );
         return;
       }
 
@@ -532,10 +551,145 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     // Create a new Speechmatics Realtime client
     const createStream = async () => {
+      console.log(`[session ${sessionId}] Creating RealtimeClient instance...`);
       const client = new RealtimeClient();
+      console.log(`[session ${sessionId}] RealtimeClient instance created`);
+
+      // Create JWT for authentication FIRST
+      if (!SPEECHMATICS_API_KEY || SPEECHMATICS_API_KEY.trim() === "") {
+        throw new Error("SPEECHMATICS_API_KEY is not set or is empty");
+      }
+
+      console.log(`[session ${sessionId}] Creating JWT token...`);
+      const jwt = await createSpeechmaticsJWT({
+        type: "rt",
+        apiKey: SPEECHMATICS_API_KEY,
+        ttl: 60, // 1 minute
+      });
+
+      if (!jwt || jwt.trim() === "") {
+        throw new Error("JWT token creation returned empty string");
+      }
+
+      console.log(`[session ${sessionId}] JWT created successfully`);
+
+      // Set up promise to wait for RecognitionStarted
+      let recognitionStartedFlag = false;
+      const audioBuffer: Buffer[] = []; // Buffer audio until RecognitionStarted
+
+      const recognitionPromise = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(
+            new Error("RecognitionStarted timeout - no response from server"),
+          );
+        }, 10000); // 10 second timeout
+
+        const onRecognitionStarted = () => {
+          clearTimeout(timeout);
+          recognitionStartedFlag = true;
+          console.log(
+            `[session ${sessionId}] RecognitionStarted event received`,
+          );
+
+          // Remove debug handler
+          if ((client as any)._debugMessageHandler) {
+            client.removeEventListener(
+              "receiveMessage",
+              (client as any)._debugMessageHandler,
+            );
+            delete (client as any)._debugMessageHandler;
+          }
+
+          // Flush buffered audio
+          if (audioBuffer.length > 0) {
+            console.log(
+              `[session ${sessionId}] Flushing ${audioBuffer.length} buffered audio chunks`,
+            );
+            for (const chunk of audioBuffer) {
+              try {
+                client.sendAudio(chunk);
+              } catch (e) {
+                console.warn(
+                  `[session ${sessionId}] Error flushing buffered audio:`,
+                  e,
+                );
+              }
+            }
+            audioBuffer.length = 0; // Clear buffer
+          }
+
+          // Remove temporary listener
+          client.removeEventListener(
+            "recognitionStarted",
+            onRecognitionStarted,
+          );
+          client.removeEventListener("error", onStartError);
+          resolve();
+        };
+
+        const onStartError = (err: any) => {
+          clearTimeout(timeout);
+          client.removeEventListener(
+            "recognitionStarted",
+            onRecognitionStarted,
+          );
+          client.removeEventListener("error", onStartError);
+
+          // Remove debug handler
+          if ((client as any)._debugMessageHandler) {
+            client.removeEventListener(
+              "receiveMessage",
+              (client as any)._debugMessageHandler,
+            );
+            delete (client as any)._debugMessageHandler;
+          }
+
+          console.error(
+            `[session ${sessionId}] Error during RecognitionStarted wait:`,
+            {
+              message: err?.message,
+              error: err,
+              type: typeof err,
+              keys: err ? Object.keys(err) : [],
+              stringified: JSON.stringify(err, Object.getOwnPropertyNames(err)),
+            },
+          );
+          reject(err);
+        };
+
+        // Set up temporary listeners for RecognitionStarted BEFORE starting
+        client.addEventListener("recognitionStarted", onRecognitionStarted);
+        client.addEventListener("error", onStartError);
+
+        // Also listen to receiveMessage to see what the server is sending
+        const debugMessageHandler = (event: any) => {
+          console.log(
+            `[session ${sessionId}] DEBUG: Received message before RecognitionStarted:`,
+            {
+              message: event.data?.message,
+              type: typeof event.data,
+              keys: event.data ? Object.keys(event.data) : [],
+              data: JSON.stringify(event.data, null, 2).substring(0, 500), // First 500 chars
+            },
+          );
+        };
+        client.addEventListener("receiveMessage", debugMessageHandler);
+
+        // Store debug handler to remove later
+        (client as any)._debugMessageHandler = debugMessageHandler;
+      });
 
       // Handle messages from Speechmatics
+      // Note: In the sample code, event listeners are set up BEFORE start()
       const streamOnMessage = (event: any) => {
+        // Only process messages after recognition has started
+        if (!recognitionStartedFlag) {
+          if (DEBUG)
+            console.log(
+              `[session ${sessionId}] Message received before recognition started, ignoring`,
+            );
+          return;
+        }
         onData(event.data, client);
       };
 
@@ -549,39 +703,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
         onError: streamOnError,
       });
 
-      client.addEventListener("receiveMessage", streamOnMessage);
-      client.addEventListener("error", streamOnError);
-
-      // Create JWT for authentication
       try {
-        // Validate API key
-        if (!SPEECHMATICS_API_KEY || SPEECHMATICS_API_KEY.trim() === "") {
-          throw new Error("SPEECHMATICS_API_KEY is not set or is empty");
-        }
+        console.log(`[session ${sessionId}] Starting recognition with JWT...`);
 
-        console.log(`[session ${sessionId}] Creating JWT token...`);
-        // Create JWT using Speechmatics auth package
-        const jwt = await createSpeechmaticsJWT({
-          type: "rt",
-          apiKey: SPEECHMATICS_API_KEY,
-          ttl: 60, // 1 minute
-        });
+        // Set up message handlers BEFORE start (matching sample code pattern)
+        // The sample code sets up event listeners before calling start()
+        client.addEventListener("receiveMessage", streamOnMessage);
+        client.addEventListener("error", streamOnError);
 
-        if (!jwt || jwt.trim() === "") {
-          throw new Error("JWT token creation returned empty string");
-        }
-
-        console.log(
-          `[session ${sessionId}] JWT created, starting recognition...`,
-        );
-        // Start the recognition session
-        // Note: audio_format is required according to API docs
-        await client.start(jwt, {
-          audio_format: {
-            type: "raw",
-            encoding: "pcm_s16le",
-            sample_rate: SAMPLE_RATE,
-          },
+        // Prepare configuration - match the sample code format
+        // Note: The sample code does NOT include audio_format in start() - only transcription_config
+        const config = {
           transcription_config: {
             language: LANGUAGE,
             language_variant: LANGUAGE_VARIANT,
@@ -589,13 +721,47 @@ export async function registerRoutes(app: Express): Promise<Server> {
             enable_partials: true,
             operating_point: "enhanced",
           },
-        });
+        };
 
-        console.log(`[session ${sessionId}] Speechmatics recognition started`);
+        if (DEBUG) {
+          console.log(
+            `[session ${sessionId}] Start config:`,
+            JSON.stringify(config, null, 2),
+          );
+          console.log(
+            `[session ${sessionId}] JWT length: ${jwt.length}, first 20 chars: ${jwt.substring(0, 20)}...`,
+          );
+        }
 
-        // Add sendAudio method
+        // Start the recognition session
+        // The client library handles audio format automatically based on how we send audio
+        await client.start(jwt, config);
+
+        console.log(
+          `[session ${sessionId}] Waiting for RecognitionStarted event...`,
+        );
+        // Wait for RecognitionStarted event BEFORE setting currentStream
+        await recognitionPromise;
+        console.log(
+          `[session ${sessionId}] Speechmatics recognition started and ready`,
+        );
+
+        // NOW set currentStream after RecognitionStarted is confirmed
+        currentStream = client;
+
+        // Add sendAudio method that buffers until RecognitionStarted
         (client as any).sendAudio = (audioData: Buffer) => {
-          client.sendAudio(audioData);
+          if (recognitionStartedFlag) {
+            client.sendAudio(audioData);
+          } else {
+            // Buffer audio until RecognitionStarted
+            audioBuffer.push(audioData);
+            if (DEBUG && audioBuffer.length === 1) {
+              console.log(
+                `[session ${sessionId}] Buffering audio until RecognitionStarted...`,
+              );
+            }
+          }
         };
 
         // Add stop method
@@ -623,7 +789,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
           stack: error?.stack,
           code: error?.code,
           name: error?.name,
+          type: typeof error,
+          keys: error ? Object.keys(error) : [],
+          fullError: JSON.stringify(error, Object.getOwnPropertyNames(error)),
         });
+        // Reset currentStream on error
+        if (currentStream === client) {
+          currentStream = null;
+        }
+        // Clean up client on error
+        try {
+          client.stopRecognition({ noTimeout: false });
+        } catch (e) {
+          // Ignore cleanup errors
+        }
         throw error;
       }
     };
@@ -723,8 +902,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     // Initialize the first stream and all monitoring systems
     const start = async () => {
+      console.log(`[session ${sessionId}] ===== STARTING TRANSCRIPTION =====`);
       try {
+        console.log(
+          `[session ${sessionId}] Step 1: Creating Speechmatics stream...`,
+        );
         currentStream = await createStream();
+        console.log(
+          `[session ${sessionId}] Step 2: Stream created successfully`,
+        );
+
         streamStartedAt = Date.now();
         lastFinalResultAt = Date.now();
         startPeriodicFlush();
@@ -732,15 +919,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         scheduleSilenceTimer();
         startHealthWatchdog();
 
-        console.log(`[session ${sessionId}] Started - transcription active`);
+        console.log(`[session ${sessionId}] ===== TRANSCRIPTION ACTIVE =====`);
       } catch (error: any) {
-        console.error(`[session ${sessionId}] Failed to start:`, error);
-        console.error(`[session ${sessionId}] Start error details:`, {
-          message: error?.message,
-          stack: error?.stack,
-          code: error?.code,
-          name: error?.name,
-        });
+        console.error(`\n[session ${sessionId}] ===== START FAILED =====`);
+        console.error(`[session ${sessionId}] Error:`, error);
+        console.error(`[session ${sessionId}] Error message:`, error?.message);
+        console.error(`[session ${sessionId}] Error stack:`, error?.stack);
+        console.error(`[session ${sessionId}] Error code:`, error?.code);
+        console.error(`[session ${sessionId}] Error name:`, error?.name);
+        console.error(
+          `[session ${sessionId}] Full error object:`,
+          JSON.stringify(error, Object.getOwnPropertyNames(error)),
+        );
+        console.error(
+          `[session ${sessionId}] ================================\n`,
+        );
+
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
             JSON.stringify({
@@ -850,11 +1044,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // If no stream or restarting, buffer audio (will be written to new stream)
       if (!currentStream || restarting) {
+        if (DEBUG && !currentStream) {
+          console.log(
+            `[session ${sessionId}] No current stream, audio will be buffered by stream's sendAudio method`,
+          );
+        }
         return;
       }
 
       try {
         // Speechmatics uses sendAudio method (sends binary data)
+        // The sendAudio method will buffer if RecognitionStarted hasn't been received yet
         if ((currentStream as any).sendAudio) {
           (currentStream as any).sendAudio(buf);
         } else if (currentStream.readyState === 1) {

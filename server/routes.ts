@@ -701,7 +701,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const config = {
           transcription_config: {
             language: LANGUAGE,
-            output_locale: LANGUAGE_VARIANT,
             enable_partials: true,
             operating_point: "enhanced" as const,
           },

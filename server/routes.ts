@@ -307,10 +307,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
     let backoffMs = 500;
 
     // Track active stream handlers to properly clean them up
-    let currentStreamHandlers: {
-      onData?: (data: any) => void;
-      onError?: (err: any) => void;
-    } = {};
+    // Store handlers per stream to avoid conflicts
+    const streamHandlers = new WeakMap<
+      any,
+      {
+        onData: (data: any) => void;
+        onError: (err: any) => void;
+      }
+    >();
 
     // ---- Utilities ----
 
@@ -433,10 +437,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
       tSegment = setTimeout(() => {
         const actualAge = Date.now() - streamStartedAt;
         console.log(
-          `[session ${sessionId}] Scheduled restart triggered at ${(actualAge / 1000).toFixed(1)}s`,
+          `[session ${sessionId}] ⏰ TIMER: Scheduled restart triggered at ${(actualAge / 1000).toFixed(1)}s (target was ${(safeSegmentMs / 1000).toFixed(0)}s)`,
         );
-        safeSegmentRestart("scheduled");
+        // Double-check we're not already restarting
+        if (!restarting && !isPaused && !isClosing) {
+          safeSegmentRestart("scheduled");
+        } else {
+          console.warn(
+            `[session ${sessionId}] Timer fired but restart blocked: restarting=${restarting}, paused=${isPaused}, closing=${isClosing}`,
+          );
+        }
       }, safeSegmentMs);
+
+      // Add a verification log after a short delay to confirm timer is set
+      setTimeout(() => {
+        if (tSegment && !restarting) {
+          const remaining = safeSegmentMs - (Date.now() - streamStartedAt);
+          console.log(
+            `[session ${sessionId}] Timer verified: ${(remaining / 1000).toFixed(0)}s until restart`,
+          );
+        }
+      }, 5000);
     };
 
     // Backoff management for error recovery
@@ -451,11 +472,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const removeStreamHandlers = (stream: any) => {
       if (!stream) return;
       try {
-        if (currentStreamHandlers.onData) {
-          stream.removeListener("data", currentStreamHandlers.onData);
-        }
-        if (currentStreamHandlers.onError) {
-          stream.removeListener("error", currentStreamHandlers.onError);
+        const handlers = streamHandlers.get(stream);
+        if (handlers) {
+          stream.removeListener("data", handlers.onData);
+          stream.removeListener("error", handlers.onError);
+          streamHandlers.delete(stream);
         }
       } catch (e) {
         console.warn(`[session ${sessionId}] Error removing handlers:`, e);
@@ -465,7 +486,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
     // ---- Stream wiring ----
 
     // Handle incoming transcription results from Google
-    const onData = async (data: any) => {
+    // CRITICAL: Check that this data is from the current active stream
+    const onData = async (data: any, sourceStream?: any) => {
+      // Ignore data from old streams that haven't been cleaned up yet
+      if (sourceStream && sourceStream !== currentStream) {
+        if (DEBUG)
+          console.log(`[session ${sessionId}] Ignoring data from old stream`);
+        return;
+      }
+
       lastDataAt = Date.now();
       const result = data?.results?.[0];
       if (!result || !result.alternatives?.length) return;
@@ -520,7 +549,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
     };
 
     // Handle errors from Google's streaming API
-    const onError = (err: any) => {
+    // CRITICAL: Check that this error is from the current active stream
+    const onError = (err: any, sourceStream?: any) => {
+      // Ignore errors from old streams that are being cleaned up
+      if (sourceStream && sourceStream !== currentStream) {
+        if (DEBUG)
+          console.log(`[session ${sessionId}] Ignoring error from old stream`);
+        return;
+      }
+
       const msg = err?.message || String(err);
       const code = err?.code;
       console.warn(
@@ -566,12 +603,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
       };
       const stream = speechClient!.streamingRecognize(request);
 
-      // CRITICAL FIX: Store handlers so we can remove them later
-      currentStreamHandlers.onData = onData;
-      currentStreamHandlers.onError = onError;
+      // CRITICAL FIX: Create stream-specific handlers that check if this is the current stream
+      const streamOnData = (data: any) => onData(data, stream);
+      const streamOnError = (err: any) => onError(err, stream);
 
-      stream.on("error", onError);
-      stream.on("data", onData);
+      // Store handlers per stream for proper cleanup
+      streamHandlers.set(stream, {
+        onData: streamOnData,
+        onError: streamOnError,
+      });
+
+      stream.on("error", streamOnError);
+      stream.on("data", streamOnData);
+
+      console.log(
+        `[session ${sessionId}] New stream created (stream #${restartCounter + 1})`,
+      );
 
       return stream;
     };
@@ -629,13 +676,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
             console.warn(`[session ${sessionId}] Bridge write failed:`, e);
           }
         }
-        if (DEBUG && bridgeWritten > 0)
+        if (bridgeWritten > 0) {
           console.log(
             `[session ${sessionId}] Bridge: ${(bridgeWritten / (SAMPLE_RATE * BYTES_PER_SAMPLE)).toFixed(2)}s written (last final result at ${(lastFinalResultEndTime / 1000).toFixed(1)}s)`,
           );
+        }
 
         // NOW reassign currentStream so incoming audio goes to the new stream
+        // CRITICAL: Switch AFTER writing bridge buffer
+        const previousStream = currentStream;
         currentStream = newStream;
+
+        console.log(
+          `[session ${sessionId}] Stream switched: old stream ended, new stream #${restartCounter} active`,
+        );
 
         // Reset the segment timer IMMEDIATELY for the new stream
         // This is critical - the timer must start the moment the new stream becomes active
@@ -651,14 +705,37 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         // CRITICAL FIX: Properly destroy old stream after overlap period
         // Use destroy() instead of end() to ensure all resources are cleaned up
+        // CRITICAL: End the old stream immediately to stop it from processing
+        // We keep it alive briefly for overlap, but stop accepting new data
         setTimeout(() => {
           try {
-            if (oldStream) {
+            if (oldStream && oldStream !== currentStream) {
+              console.log(`[session ${sessionId}] Cleaning up old stream`);
               removeStreamHandlers(oldStream);
               if (!oldStream.destroyed) {
-                oldStream.destroy();
-                if (DEBUG)
-                  console.log(`[session ${sessionId}] Old stream destroyed`);
+                // End the stream first to stop processing, then destroy
+                try {
+                  oldStream.end();
+                } catch (e) {
+                  // Ignore end errors
+                }
+                // Small delay before destroy to ensure end completes
+                setTimeout(() => {
+                  try {
+                    if (!oldStream.destroyed) {
+                      oldStream.destroy();
+                      if (DEBUG)
+                        console.log(
+                          `[session ${sessionId}] Old stream destroyed`,
+                        );
+                    }
+                  } catch (e) {
+                    console.warn(
+                      `[session ${sessionId}] Old stream destroy failed:`,
+                      e,
+                    );
+                  }
+                }, 100);
               }
             }
           } catch (e) {
@@ -718,10 +795,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const streamAge = Date.now() - streamStartedAt;
       if (streamAge > SEGMENT_MS - 10000 && !restarting) {
         console.warn(
-          `[session ${sessionId}] Safety restart at ${(streamAge / 1000).toFixed(1)}s`,
+          `[session ${sessionId}] SAFETY RESTART triggered at ${(streamAge / 1000).toFixed(1)}s (timer may have failed)`,
         );
         safeSegmentRestart("safety");
         // Don't return - still process this message after triggering restart
+      }
+
+      // Additional safety: If stream age exceeds limit significantly, force immediate restart
+      if (streamAge > SEGMENT_MS + 10000 && !restarting) {
+        console.error(
+          `[session ${sessionId}] CRITICAL: Stream age ${(streamAge / 1000).toFixed(1)}s exceeds limit! Forcing immediate restart`,
+        );
+        safeSegmentRestart("safety");
       }
 
       // Control messages are JSON (typically small)
@@ -786,24 +871,48 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Audio data path: write to current stream and update bridge buffer
       // CRITICAL FIX: Check if stream exists and is not destroyed before writing
-      if (!currentStream || currentStream.destroyed || restarting) {
-        // If stream is being restarted, buffer the audio temporarily
-        // In practice, restarts are fast enough that this shouldn't be needed
-        // but it's a safety measure
+      if (!currentStream) {
+        console.warn(
+          `[session ${sessionId}] No current stream, dropping audio`,
+        );
         return;
+      }
+
+      if (currentStream.destroyed) {
+        console.warn(
+          `[session ${sessionId}] Current stream destroyed, dropping audio`,
+        );
+        return;
+      }
+
+      if (restarting) {
+        // During restart, we should still write to the new stream
+        // The restart flag will be cleared soon, but audio should go to new stream
+        if (DEBUG)
+          console.log(
+            `[session ${sessionId}] Writing during restart transition`,
+          );
       }
 
       const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg as string);
       try {
-        currentStream.write(buf);
+        // Write to current stream (which should be the new stream after restart)
+        const written = currentStream.write(buf);
+        if (!written && DEBUG) {
+          console.log(
+            `[session ${sessionId}] Stream buffer full, audio may be buffered`,
+          );
+        }
         writeToBridge(buf);
       } catch (e) {
         // Stream might be closing during restart; this is expected
         // The next restart will create a fresh stream
-        console.warn(
-          `[session ${sessionId}] Write failed (may be restarting):`,
-          e,
-        );
+        console.warn(`[session ${sessionId}] Write failed:`, e);
+        // If write fails, try to restart
+        if (!restarting) {
+          console.warn(`[session ${sessionId}] Write error triggered restart`);
+          safeSegmentRestart("error");
+        }
       }
 
       // Note: We do NOT reset the silence timer here

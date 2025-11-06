@@ -620,63 +620,49 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
           // Remove temporary listener
           client.removeEventListener(
-            "recognitionStarted",
-            onRecognitionStarted,
+            "receiveMessage",
+            recognitionStartedHandler as any,
           );
-          client.removeEventListener("error", onStartError);
           resolve();
         };
 
-        const onStartError = (err: any) => {
-          clearTimeout(timeout);
-          client.removeEventListener(
-            "recognitionStarted",
-            onRecognitionStarted,
-          );
-          client.removeEventListener("error", onStartError);
-
-          // Remove debug handler
-          if ((client as any)._debugMessageHandler) {
-            client.removeEventListener(
-              "receiveMessage",
-              (client as any)._debugMessageHandler,
+        // Speechmatics uses receiveMessage for all events - check message type
+        const recognitionStartedHandler = (event: any) => {
+          const msg = event.data;
+          
+          if (DEBUG) {
+            console.log(
+              `[session ${sessionId}] DEBUG: Received message before RecognitionStarted:`,
+              {
+                message: msg?.message,
+                type: typeof msg,
+                keys: msg ? Object.keys(msg) : [],
+                data: JSON.stringify(msg, null, 2).substring(0, 500),
+              },
             );
-            delete (client as any)._debugMessageHandler;
           }
 
-          console.error(
-            `[session ${sessionId}] Error during RecognitionStarted wait:`,
-            {
-              message: err?.message,
-              error: err,
-              type: typeof err,
-              keys: err ? Object.keys(err) : [],
-              stringified: JSON.stringify(err, Object.getOwnPropertyNames(err)),
-            },
-          );
-          reject(err);
+          if (msg?.message === 'RecognitionStarted') {
+            onRecognitionStarted();
+          } else if (msg?.message === 'Error') {
+            clearTimeout(timeout);
+            client.removeEventListener(
+              "receiveMessage",
+              recognitionStartedHandler as any,
+            );
+            console.error(
+              `[session ${sessionId}] Error during RecognitionStarted wait:`,
+              {
+                message: msg?.reason || msg?.type,
+                error: msg,
+              },
+            );
+            reject(new Error(msg?.type || msg?.reason || 'Unknown error'));
+          }
         };
 
-        // Set up temporary listeners for RecognitionStarted BEFORE starting
-        client.addEventListener("recognitionStarted", onRecognitionStarted);
-        client.addEventListener("error", onStartError);
-
-        // Also listen to receiveMessage to see what the server is sending
-        const debugMessageHandler = (event: any) => {
-          console.log(
-            `[session ${sessionId}] DEBUG: Received message before RecognitionStarted:`,
-            {
-              message: event.data?.message,
-              type: typeof event.data,
-              keys: event.data ? Object.keys(event.data) : [],
-              data: JSON.stringify(event.data, null, 2).substring(0, 500), // First 500 chars
-            },
-          );
-        };
-        client.addEventListener("receiveMessage", debugMessageHandler);
-
-        // Store debug handler to remove later
-        (client as any)._debugMessageHandler = debugMessageHandler;
+        // Set up temporary listener for RecognitionStarted BEFORE starting
+        client.addEventListener("receiveMessage", recognitionStartedHandler as any);
       });
 
       // Handle messages from Speechmatics
@@ -709,17 +695,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // Set up message handlers BEFORE start (matching sample code pattern)
         // The sample code sets up event listeners before calling start()
         client.addEventListener("receiveMessage", streamOnMessage);
-        client.addEventListener("error", streamOnError);
 
         // Prepare configuration - match the sample code format
         // Note: The sample code does NOT include audio_format in start() - only transcription_config
         const config = {
           transcription_config: {
             language: LANGUAGE,
-            language_variant: LANGUAGE_VARIANT,
             output_locale: LANGUAGE_VARIANT,
             enable_partials: true,
-            operating_point: "enhanced",
+            operating_point: "enhanced" as const,
           },
         };
 
@@ -766,12 +750,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         // Add stop method
         (client as any).stop = () => {
-          client.stopRecognition({ noTimeout: false });
+          client.stopRecognition({ noTimeout: true });
         };
 
         // Add close method
         (client as any).close = () => {
-          client.stopRecognition({ noTimeout: false });
+          client.stopRecognition({ noTimeout: true });
         };
 
         console.log(
@@ -799,7 +783,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
         // Clean up client on error
         try {
-          client.stopRecognition({ noTimeout: false });
+          client.stopRecognition({ noTimeout: true });
         } catch (e) {
           // Ignore cleanup errors
         }

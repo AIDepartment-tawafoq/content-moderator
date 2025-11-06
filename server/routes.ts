@@ -498,19 +498,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return;
       }
 
-      // Debug: Log transcript messages
-      if (DEBUG) {
-        console.log(
-          `[session ${sessionId}] onData received transcript message:`,
-          {
-            message: data?.message,
-            hasResults: !!data?.results,
-            resultsIsArray: Array.isArray(data?.results),
-            resultsLength: data?.results?.length,
-          },
-        );
-      }
-
       if (
         data.message === "AddTranscript" ||
         data.message === "AddPartialTranscript"
@@ -525,16 +512,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
             .join(" ");
         }
 
-        console.log(
-          `[session ${sessionId}] Extracted transcript: "${transcript}" (message: ${data.message})`,
-        );
-
+        // Silently ignore empty transcripts (normal during silence)
         if (!transcript) {
-          console.log(
-            `[session ${sessionId}] Empty transcript extracted. Full data:`,
-            JSON.stringify(data, null, 2),
-          );
           return;
+        }
+
+        // Only log when DEBUG is enabled
+        if (DEBUG) {
+          console.log(
+            `[session ${sessionId}] Extracted transcript: "${transcript}" (${data.message})`,
+          );
         }
 
         const isFinal = data.message === "AddTranscript";
@@ -546,8 +533,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
           await flushTranscript();
           scheduleSilenceTimer();
 
-          if (DEBUG)
-            console.log(`[session ${sessionId}] Final: "${transcript}"`);
+          // Log final transcripts (important for debugging)
+          console.log(`[session ${sessionId}] ✓ Final: "${transcript}"`);
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(
               JSON.stringify({
@@ -558,7 +545,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             );
           }
         } else {
-          // Partial/interim results
+          // Partial/interim results - only log if DEBUG enabled
           if (DEBUG)
             console.log(`[session ${sessionId}] Partial: "${transcript}"`);
           if (ws.readyState === WebSocket.OPEN) {
@@ -648,16 +635,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
           clearTimeout(timeout);
           recognitionStartedFlag = true;
           console.log(
-            `[session ${sessionId}] RecognitionStarted event received`,
+            `[session ${sessionId}] ✓ RecognitionStarted - ready to receive audio`,
           );
 
           // Flush buffered audio after a short delay to ensure socket is fully ready
           // Speechmatics needs a moment after RecognitionStarted before accepting audio
           setTimeout(() => {
             if (audioBuffer.length > 0) {
-              console.log(
-                `[session ${sessionId}] Flushing ${audioBuffer.length} buffered audio chunks`,
-              );
+              if (DEBUG) {
+                console.log(
+                  `[session ${sessionId}] Flushing ${audioBuffer.length} buffered audio chunks`,
+                );
+              }
               for (const chunk of audioBuffer) {
                 try {
                   // Use the original method directly, not the wrapped one
@@ -699,14 +688,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // Set up a handler to listen for RecognitionStarted message
         const recognitionStartedMessageHandler = (event: any) => {
           const msg = event.data;
-          console.log(
-            `[session ${sessionId}] recognitionStartedMessageHandler received:`,
-            {
-              message: msg?.message,
-              type: typeof msg,
-              keys: msg ? Object.keys(msg) : [],
-            },
-          );
+
+          // Only log if DEBUG enabled
+          if (DEBUG) {
+            console.log(
+              `[session ${sessionId}] recognitionStartedMessageHandler received:`,
+              {
+                message: msg?.message,
+              },
+            );
+          }
 
           if (msg?.message === "RecognitionStarted") {
             console.log(
@@ -744,31 +735,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const streamOnMessage = (event: any) => {
         const msg = event.data;
 
-        // Only log transcript and error messages to reduce noise
-        if (
-          DEBUG &&
-          (msg?.message === "AddTranscript" ||
-            msg?.message === "AddPartialTranscript" ||
-            msg?.message === "Error")
-        ) {
-          console.log(`[session ${sessionId}] streamOnMessage received:`, {
-            message: msg?.message,
-            recognitionStartedFlag,
-          });
-        }
-
         // Only process messages after recognition has started
         if (!recognitionStartedFlag) {
-          if (
-            DEBUG &&
-            msg?.message !== "Info" &&
-            msg?.message !== "AudioAdded"
-          ) {
-            console.log(
-              `[session ${sessionId}] Message received before recognition started, ignoring:`,
-              msg?.message,
-            );
-          }
+          // Silently ignore messages before recognition started
           return;
         }
 
@@ -824,14 +793,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // audio_format is required for raw PCM audio over WebSocket
         await client.start(jwt, config);
 
-        console.log(
-          `[session ${sessionId}] Waiting for RecognitionStarted event...`,
-        );
         // Wait for RecognitionStarted event BEFORE setting currentStream
         await recognitionPromise;
-        console.log(
-          `[session ${sessionId}] Speechmatics recognition started and ready`,
-        );
 
         // NOW set currentStream after RecognitionStarted is confirmed
         currentStream = client;
@@ -1133,11 +1096,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // If no stream or restarting, buffer audio (will be written to new stream)
       if (!currentStream || restarting) {
-        if (DEBUG && !currentStream) {
-          console.log(
-            `[session ${sessionId}] No current stream, audio will be buffered by stream's sendAudio method`,
-          );
-        }
         return;
       }
 
@@ -1161,12 +1119,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       } catch (e: any) {
         // Don't restart on "Socket not ready" errors - just wait a bit
         if (e?.message?.includes("Socket not ready")) {
-          if (DEBUG) {
-            console.log(
-              `[session ${sessionId}] Socket not ready, audio will be buffered`,
-            );
-          }
-          // Audio will be buffered by the sendAudio wrapper
+          // Audio will be buffered by the sendAudio wrapper - silently handle
           return;
         }
         console.warn(`[session ${sessionId}] Write failed:`, e);

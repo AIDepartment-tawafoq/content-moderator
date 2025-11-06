@@ -600,30 +600,33 @@ export async function registerRoutes(app: Express): Promise<Server> {
             delete (client as any)._debugMessageHandler;
           }
 
-          // Flush buffered audio
-          if (audioBuffer.length > 0) {
-            console.log(
-              `[session ${sessionId}] Flushing ${audioBuffer.length} buffered audio chunks`,
-            );
-            for (const chunk of audioBuffer) {
-              try {
-                client.sendAudio(chunk);
-              } catch (e) {
-                console.warn(
-                  `[session ${sessionId}] Error flushing buffered audio:`,
-                  e,
-                );
-              }
-            }
-            audioBuffer.length = 0; // Clear buffer
-          }
-
           // Remove temporary listener
           client.removeEventListener(
             "receiveMessage",
             recognitionStartedHandler as any,
           );
-          resolve();
+
+          // Wait 500ms for socket to be fully ready before sending audio
+          setTimeout(() => {
+            // Flush buffered audio after socket is ready
+            if (audioBuffer.length > 0) {
+              console.log(
+                `[session ${sessionId}] Flushing ${audioBuffer.length} buffered audio chunks`,
+              );
+              for (const chunk of audioBuffer) {
+                try {
+                  client.sendAudio(chunk);
+                } catch (e) {
+                  console.warn(
+                    `[session ${sessionId}] Error flushing buffered audio:`,
+                    e,
+                  );
+                }
+              }
+              audioBuffer.length = 0; // Clear buffer
+            }
+            resolve();
+          }, 500);
         };
 
         // Speechmatics uses receiveMessage for all events - check message type

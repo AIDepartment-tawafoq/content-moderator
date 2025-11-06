@@ -1,12 +1,12 @@
 // Enhanced Speech-to-Text WebSocket Server
-// Fixed version with proper stream lifecycle management
+// Using Speechmatics Realtime API
 
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
 import { initSessionSchema, updateSessionSchema } from "@shared/schema";
-import { SpeechClient } from "@google-cloud/speech";
+// Using raw WebSocket for Speechmatics Realtime API
 import crypto from "crypto";
 import fs from "fs";
 
@@ -38,65 +38,25 @@ setInterval(
   60 * 60 * 1000,
 );
 
-// ========== Speech Client Initialization ==========
+// ========== Speechmatics Realtime API Configuration ==========
 
-// Flexible credentials loader
-let credentialsConfig: any = undefined;
-if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
-  try {
-    credentialsConfig = JSON.parse(
-      process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON,
-    );
-  } catch (err) {
-    console.error(
-      "✗ Failed to parse GOOGLE_APPLICATION_CREDENTIALS_JSON:",
-      err,
-    );
-  }
-} else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-  try {
-    const p = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-    if (fs.existsSync(p))
-      credentialsConfig = JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch (err) {
-    console.error("✗ Failed to read credentials file:", err);
-  }
-}
-
-// Environment-driven config
-const PROJECT_ID =
-  process.env.GOOGLE_CLOUD_PROJECT ||
-  credentialsConfig?.project_id ||
-  "not-configured";
-const REGION = (process.env.STT_LOCATION || "global").toLowerCase();
-const MODEL = process.env.STT_MODEL || "long";
-// Enable debug mode by default to track transcription issues
+const SPEECHMATICS_API_KEY = process.env.SPEECHMATICS_API_KEY || "";
+const SPEECHMATICS_URL =
+  process.env.SPEECHMATICS_URL || "wss://eu2.rt.speechmatics.com/v2";
 const DEBUG = ["1", "true", "yes"].includes(
   (process.env.DEBUG || "1").toLowerCase(),
 );
-// Force Arabic-only transcription - no English alternatives
-const LANGUAGES = (process.env.STT_LANGS || "ar-SA,ar-EG,ar-AE")
-  .split(",")
-  .map((x) => x.trim());
-const PRIMARY_LANG = LANGUAGES[0] || "ar-SA";
-const ALT_LANGS = LANGUAGES.slice(1, 3).filter((lang) =>
-  lang.startsWith("ar-"),
-);
 
-// Endpoint selection
-let apiEndpoint = "speech.googleapis.com";
-if (["us", "eu"].includes(REGION))
-  apiEndpoint = `${REGION}-speech.googleapis.com`;
+// Language configuration - Arabic
+const LANGUAGE = process.env.STT_LANG || "ar";
+const LANGUAGE_VARIANT = process.env.STT_LANG_VARIANT || "ar-SA";
 
-let speechClient: SpeechClient | undefined;
-try {
-  const opts: any = { apiEndpoint };
-  if (credentialsConfig) opts.credentials = credentialsConfig;
-  speechClient = new SpeechClient(opts);
-  console.log(`✓ SpeechClient ready [${PROJECT_ID}] @ ${apiEndpoint}`);
-} catch (err: any) {
-  console.error("✗ Could not initialize SpeechClient:", err.message);
+if (!SPEECHMATICS_API_KEY) {
+  console.error("✗ SPEECHMATICS_API_KEY environment variable is required");
 }
+
+console.log(`✓ Speechmatics Realtime API configured: ${SPEECHMATICS_URL}`);
+console.log(`✓ Language: ${LANGUAGE} (${LANGUAGE_VARIANT})`);
 
 // ========== Main App ==========
 export async function registerRoutes(app: Express): Promise<Server> {
@@ -251,30 +211,31 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const sessionId = url.searchParams.get("sessionId");
     if (!sessionId) return ws.close(1008, "Missing sessionId");
 
-    if (!speechClient) {
-      ws.send(JSON.stringify({ type: "error", message: "STT unavailable" }));
+    if (!SPEECHMATICS_API_KEY) {
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          message: "Speechmatics API key not configured",
+        }),
+      );
       return ws.close();
     }
 
     console.log(`[session ${sessionId}] WebSocket connected`);
 
     // ---- Tunables (safe defaults) ----
-    // Based on Google's sample code: STREAMING_LIMIT = 240000 (4 minutes)
-    // We restart at exactly 4 minutes to match Google's recommended approach
+    // Speechmatics doesn't have a 5-minute limit, but we restart periodically for reliability
     const SAMPLE_RATE = 16000; // 16kHz PCM mono
     const BYTES_PER_SAMPLE = 2; // 16-bit
-    // CRITICAL: Match Google sample's 4-minute limit exactly
-    // Google's limit is 5 minutes, but sample code uses 4 minutes (240000ms)
-    const STREAMING_LIMIT = 240000; // 4 minutes exactly (matches Google sample)
-    const SEGMENT_MS = STREAMING_LIMIT; // Use same value for consistency
-    const RESTART_BUFFER_MS = 0; // No buffer needed - restart at exactly 4 minutes
-    const BRIDGE_SEC = 3; // bridge tail audio into next segment (matches Google sample approach)
+    const STREAMING_LIMIT = 240000; // 4 minutes - restart periodically for reliability
+    const SEGMENT_MS = STREAMING_LIMIT;
+    const RESTART_BUFFER_MS = 0;
+    const BRIDGE_SEC = 3; // bridge tail audio into next segment
     const MAX_BRIDGE = BRIDGE_SEC * SAMPLE_RATE * BYTES_PER_SAMPLE;
     const FLUSH_EVERY_MS = 30_000; // periodic flush
     const SILENCE_TIMEOUT_MS = 5 * 60 * 1000; // end session if no final words this long
     const HEALTH_NO_DATA_MS = 45_000; // watchdog restart if no data seen this long
     const MAX_BACKOFF_MS = 10_000; // cap for exponential backoff
-    // No overlap - we end old stream completely before creating new one (matches Google sample)
 
     // ---- State ----
     let accumulated = "";
@@ -453,14 +414,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       backoffMs = 500;
     };
 
-    // CRITICAL FIX: Properly remove event handlers from old stream
+    // Remove event handlers from old stream
     const removeStreamHandlers = (stream: any) => {
       if (!stream) return;
       try {
         const handlers = streamHandlers.get(stream);
         if (handlers) {
-          stream.removeListener("data", handlers.onData);
-          stream.removeListener("error", handlers.onError);
+          // WebSocket uses removeListener
+          if (stream.removeListener) {
+            stream.removeListener("message", handlers.onData);
+            stream.removeListener("error", handlers.onError);
+            stream.removeListener("close", () => {});
+          }
           streamHandlers.delete(stream);
         }
       } catch (e) {
@@ -470,10 +435,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     // ---- Stream wiring ----
 
-    // Handle incoming transcription results from Google
-    // CRITICAL: Check that this data is from the current active stream
-    const onData = async (data: any, sourceStream?: any) => {
-      // Ignore data from old streams that haven't been cleaned up yet
+    // Handle incoming transcription results from Speechmatics
+    const onData = async (message: any, sourceStream?: any) => {
+      // Ignore data from old streams
       if (sourceStream && sourceStream !== currentStream) {
         if (DEBUG)
           console.log(`[session ${sessionId}] Ignoring data from old stream`);
@@ -481,62 +445,74 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       lastDataAt = Date.now();
-      const result = data?.results?.[0];
-      if (!result || !result.alternatives?.length) return;
-      const transcript = (result.alternatives[0].transcript || "").trim();
-      if (!transcript) return;
 
-      // Track result end time (inspired by Google sample code)
-      // This helps with bridging and maintaining continuity across restarts
-      if (result.resultEndTime) {
-        const resultSeconds = result.resultEndTime.seconds || 0;
-        // Google API uses nanos (nanoseconds), convert to milliseconds
-        const resultNanos = result.resultEndTime.nanos || 0;
-        const resultMillis = resultNanos / 1_000_000;
-        lastResultEndTime = resultSeconds * 1000 + resultMillis;
+      // Speechmatics message format
+      // Messages can be AddTranscript (final) or AddPartialTranscript (interim)
+      if (
+        message.message === "AddTranscript" ||
+        message.message === "AddPartialTranscript"
+      ) {
+        // Extract transcript from Speechmatics format
+        // Transcript is in results array, each result has alternatives with content
+        let transcript = "";
 
-        if (result.isFinal) {
-          lastFinalResultEndTime = lastResultEndTime;
+        if (message.results && Array.isArray(message.results)) {
+          // Combine all results into one transcript
+          const transcriptParts: string[] = [];
+          for (const result of message.results) {
+            if (result.alternatives && Array.isArray(result.alternatives)) {
+              for (const alt of result.alternatives) {
+                if (alt.content) {
+                  transcriptParts.push(alt.content);
+                }
+              }
+            }
+          }
+          transcript = transcriptParts.join(" ");
         }
-      }
 
-      if (result.isFinal) {
-        // Final results are added to our accumulated transcript
-        accumulated += (accumulated ? " " : "") + transcript;
-        lastFinalResultAt = Date.now(); // Track when we got the final result
-        await flushTranscript(); // Persist each final chunk immediately
-        scheduleSilenceTimer(); // Reset silence timer on final words
+        if (!transcript) return;
 
-        if (DEBUG) console.log(`[session ${sessionId}] Final: "${transcript}"`);
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: "transcript",
-              text: transcript,
-              isFinal: true,
-            }),
-          );
-        }
-      } else {
-        // Interim results are sent but not accumulated
-        if (DEBUG)
-          console.log(`[session ${sessionId}] Interim: "${transcript}"`);
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: "transcript",
-              text: transcript,
-              isFinal: false,
-            }),
-          );
+        const isFinal = message.message === "AddTranscript";
+
+        if (isFinal) {
+          // Final results are added to our accumulated transcript
+          accumulated += (accumulated ? " " : "") + transcript;
+          lastFinalResultAt = Date.now();
+          await flushTranscript();
+          scheduleSilenceTimer();
+
+          if (DEBUG)
+            console.log(`[session ${sessionId}] Final: "${transcript}"`);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "transcript",
+                text: transcript,
+                isFinal: true,
+              }),
+            );
+          }
+        } else {
+          // Partial/interim results
+          if (DEBUG)
+            console.log(`[session ${sessionId}] Partial: "${transcript}"`);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "transcript",
+                text: transcript,
+                isFinal: false,
+              }),
+            );
+          }
         }
       }
     };
 
-    // Handle errors from Google's streaming API
-    // CRITICAL: Check that this error is from the current active stream
+    // Handle errors from Speechmatics
     const onError = (err: any, sourceStream?: any) => {
-      // Ignore errors from old streams that are being cleaned up
+      // Ignore errors from old streams
       if (sourceStream && sourceStream !== currentStream) {
         if (DEBUG)
           console.log(`[session ${sessionId}] Ignoring error from old stream`);
@@ -544,68 +520,154 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const msg = err?.message || String(err);
-      const code = err?.code;
-      console.warn(
-        `[session ${sessionId}] Stream error code=${code} msg=${msg}`,
-      );
+      console.warn(`[session ${sessionId}] Speechmatics error: ${msg}`);
 
-      // Don't restart if we're already closing or paused
       if (isClosing || isPaused) return;
 
-      // Common termination markers from Google that indicate we need to restart
+      // Restart on connection errors
       if (
-        code === 11 || // RESOURCE_EXHAUSTED / RST
-        msg.includes("RST_STREAM") ||
-        msg.includes("INTERNAL") ||
-        msg.includes("No status received") ||
-        msg.includes("GOAWAY") ||
-        msg.includes("DEADLINE_EXCEEDED")
+        msg.includes("ECONNRESET") ||
+        msg.includes("ETIMEDOUT") ||
+        msg.includes("WebSocket") ||
+        msg.includes("connection")
       ) {
         increaseBackoff();
         setTimeout(() => safeSegmentRestart("error"), backoffMs);
         return;
       }
 
-      // Unknown errors: still try a restart with backoff
+      // Other errors: try restart with backoff
       increaseBackoff();
       setTimeout(() => safeSegmentRestart("error"), backoffMs);
     };
 
-    // Create a new Google streaming recognition stream
+    // Create a new Speechmatics Realtime WebSocket connection
     const createStream = () => {
-      const request = {
-        config: {
-          encoding: "LINEAR16" as const,
-          sampleRateHertz: SAMPLE_RATE,
-          languageCode: PRIMARY_LANG,
-          alternativeLanguageCodes: ALT_LANGS,
-          enableAutomaticPunctuation: true,
-          model: "latest_long",
-          useEnhanced: true,
-          singleUtterance: false,
+      // Use the WebSocket class already imported
+      const ws = new WebSocket(SPEECHMATICS_URL, {
+        headers: {
+          Authorization: `Bearer ${SPEECHMATICS_API_KEY}`,
         },
-        interimResults: true,
+      });
+
+      let recognitionStarted = false;
+      let audioSeqNo = 0;
+
+      // Handle WebSocket messages
+      const streamOnMessage = (data: any) => {
+        try {
+          const message = JSON.parse(data.toString());
+
+          if (message.message === "RecognitionStarted") {
+            recognitionStarted = true;
+            console.log(
+              `[session ${sessionId}] Speechmatics recognition started: ${message.id}`,
+            );
+          } else if (message.message === "AudioAdded") {
+            // Audio was accepted
+            if (DEBUG)
+              console.log(
+                `[session ${sessionId}] AudioAdded: seq_no=${message.seq_no}`,
+              );
+          } else if (
+            message.message === "AddTranscript" ||
+            message.message === "AddPartialTranscript"
+          ) {
+            // Forward transcription messages to our handler
+            onData(message, ws);
+          } else if (message.message === "Error") {
+            console.error(
+              `[session ${sessionId}] Speechmatics error: ${message.reason} (type: ${message.type})`,
+            );
+            onError(new Error(message.reason), ws);
+          } else if (message.message === "Warning") {
+            console.warn(
+              `[session ${sessionId}] Speechmatics warning: ${message.reason} (type: ${message.type})`,
+            );
+          } else if (message.message === "EndOfTranscript") {
+            console.log(`[session ${sessionId}] EndOfTranscript received`);
+          }
+        } catch (e) {
+          console.warn(`[session ${sessionId}] Failed to parse message:`, e);
+        }
       };
-      const stream = speechClient!.streamingRecognize(request);
 
-      // CRITICAL FIX: Create stream-specific handlers that check if this is the current stream
-      const streamOnData = (data: any) => onData(data, stream);
-      const streamOnError = (err: any) => onError(err, stream);
+      const streamOnError = (err: any) => {
+        onError(err, ws);
+      };
 
-      // Store handlers per stream for proper cleanup
-      streamHandlers.set(stream, {
-        onData: streamOnData,
+      const streamOnClose = () => {
+        console.log(`[session ${sessionId}] Speechmatics WebSocket closed`);
+        if (currentStream === ws && !isClosing) {
+          // Connection closed unexpectedly, restart
+          safeSegmentRestart("error");
+        }
+      };
+
+      // Store handlers
+      streamHandlers.set(ws, {
+        onData: streamOnMessage,
         onError: streamOnError,
       });
 
-      stream.on("error", streamOnError);
-      stream.on("data", streamOnData);
+      ws.on("message", streamOnMessage);
+      ws.on("error", streamOnError);
+      ws.on("close", streamOnClose);
+
+      // Send StartRecognition message once connected
+      ws.on("open", () => {
+        console.log(`[session ${sessionId}] Speechmatics WebSocket connected`);
+
+        const startMessage = {
+          message: "StartRecognition",
+          audio_format: {
+            type: "raw",
+            encoding: "pcm_s16le",
+            sample_rate: SAMPLE_RATE,
+          },
+          transcription_config: {
+            language: LANGUAGE,
+            language_variant: LANGUAGE_VARIANT,
+            output_locale: LANGUAGE_VARIANT,
+            enable_partials: true,
+            max_delay: 2.0,
+          },
+        };
+
+        ws.send(JSON.stringify(startMessage));
+        console.log(`[session ${sessionId}] StartRecognition sent`);
+      });
+
+      // Store audio sequence number function
+      (ws as any).sendAudio = (audioData: Buffer) => {
+        if (ws.readyState === 1 && recognitionStarted) {
+          // WebSocket.OPEN = 1
+          audioSeqNo++;
+          // Send binary audio data
+          ws.send(audioData);
+        }
+      };
+
+      (ws as any).stop = () => {
+        if (ws.readyState === 1) {
+          // WebSocket.OPEN = 1
+          const endMessage = {
+            message: "EndOfStream",
+            last_seq_no: audioSeqNo,
+          };
+          ws.send(JSON.stringify(endMessage));
+        }
+      };
+
+      (ws as any).close = () => {
+        ws.close();
+      };
 
       console.log(
-        `[session ${sessionId}] New stream created (stream #${restartCounter + 1})`,
+        `[session ${sessionId}] New Speechmatics stream created (stream #${restartCounter + 1})`,
       );
 
-      return stream;
+      return ws;
     };
 
     // Simple restart: End old stream, create new stream, continue
@@ -633,13 +695,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
           console.log(`[session ${sessionId}] Ending old stream...`);
           removeStreamHandlers(oldStream);
           try {
-            if (!oldStream.destroyed) oldStream.end();
-          } catch (e) {}
-          setTimeout(() => {
-            try {
-              if (!oldStream.destroyed) oldStream.destroy();
-            } catch (e) {}
-          }, 100);
+            // Send EndOfStream and close WebSocket
+            if (oldStream.readyState === 1) {
+              // WebSocket.OPEN = 1
+              if ((oldStream as any).stop) {
+                (oldStream as any).stop();
+              }
+            }
+            if ((oldStream as any).close) {
+              (oldStream as any).close();
+            }
+          } catch (e) {
+            console.warn(
+              `[session ${sessionId}] Error stopping old stream:`,
+              e,
+            );
+          }
         }
 
         // 3. Clear reference and increment counter
@@ -653,8 +724,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // 5. Write bridge buffer for continuity
         for (const chunk of bridgeBuffer) {
           try {
-            newStream.write(chunk);
-          } catch (e) {}
+            // Speechmatics uses sendAudio method
+            if (newStream.sendAudio) {
+              newStream.sendAudio(chunk);
+            }
+          } catch (e) {
+            console.warn(`[session ${sessionId}] Bridge write failed:`, e);
+          }
         }
 
         // 6. Activate new stream
@@ -734,9 +810,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
               try {
                 if (currentStream) {
                   removeStreamHandlers(currentStream);
-                  if (!currentStream.destroyed) {
-                    currentStream.destroy();
-                  }
+                  if ((currentStream as any).stop)
+                    (currentStream as any).stop();
+                  if ((currentStream as any).close)
+                    (currentStream as any).close();
                 }
               } catch {}
               return;
@@ -749,7 +826,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
               resetBackoff();
               if (currentStream) {
                 removeStreamHandlers(currentStream);
-                currentStream.destroy();
+                if ((currentStream as any).stop) (currentStream as any).stop();
+                if ((currentStream as any).close)
+                  (currentStream as any).close();
               }
               currentStream = createStream();
               streamStartedAt = Date.now();
@@ -786,15 +865,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return;
       }
 
-      if (currentStream.destroyed) {
-        if (!restarting) {
-          safeSegmentRestart("error");
-        }
-        return;
-      }
-
       try {
-        currentStream.write(buf);
+        // Speechmatics uses sendAudio method (sends binary data)
+        if ((currentStream as any).sendAudio) {
+          (currentStream as any).sendAudio(buf);
+        } else if (currentStream.readyState === 1) {
+          // WebSocket.OPEN = 1
+          // Fallback: send binary directly
+          currentStream.send(buf);
+        } else {
+          console.warn(
+            `[session ${sessionId}] Stream not ready (state: ${currentStream.readyState})`,
+          );
+          if (!restarting) {
+            safeSegmentRestart("error");
+          }
+        }
       } catch (e) {
         console.warn(`[session ${sessionId}] Write failed:`, e);
         if (!restarting) {
@@ -814,10 +900,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       try {
         if (currentStream) {
           removeStreamHandlers(currentStream);
-          if (!currentStream.destroyed) {
-            currentStream.destroy();
-            console.log(`[session ${sessionId}] Stream destroyed`);
-          }
+          if ((currentStream as any).stop) (currentStream as any).stop();
+          if ((currentStream as any).close) (currentStream as any).close();
+          console.log(`[session ${sessionId}] Stream closed`);
         }
       } catch (e) {
         console.warn(`[session ${sessionId}] Stream cleanup failed:`, e);

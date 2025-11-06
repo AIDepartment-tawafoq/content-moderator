@@ -732,10 +732,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // NOW set currentStream after RecognitionStarted is confirmed
         currentStream = client;
 
+        // Save original sendAudio before wrapping it
+        const originalSendAudio = client.sendAudio.bind(client);
+        
         // Add sendAudio method that buffers until RecognitionStarted
         (client as any).sendAudio = (audioData: Buffer) => {
           if (recognitionStartedFlag) {
-            client.sendAudio(audioData);
+            originalSendAudio(audioData);
           } else {
             // Buffer audio until RecognitionStarted
             audioBuffer.push(audioData);

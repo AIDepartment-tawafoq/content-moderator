@@ -465,6 +465,52 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Speechmatics message format from real-time-client
       // Format: data.results.map((r) => r.alternatives?.[0].content).join(' ')
+
+      // Handle Error messages
+      if (data.message === "Error") {
+        const errorType = data.type || "unknown";
+        const errorReason = data.reason || "Unknown error";
+        console.error(
+          `[session ${sessionId}] Speechmatics error in onData: ${errorType} - ${errorReason}`,
+        );
+
+        // Don't restart on quota errors - just log them
+        if (errorType === "quota_exceeded") {
+          console.warn(
+            `[session ${sessionId}] Quota exceeded - waiting before retry`,
+          );
+          return;
+        }
+
+        // For other errors, trigger restart
+        if (!restarting && !isClosing) {
+          onError(new Error(`${errorType}: ${errorReason}`), sourceStream);
+        }
+        return;
+      }
+
+      // Only process transcript messages - ignore Info, AudioAdded, etc.
+      if (
+        data.message !== "AddTranscript" &&
+        data.message !== "AddPartialTranscript"
+      ) {
+        // Silently ignore non-transcript messages (Info, AudioAdded, etc.)
+        return;
+      }
+
+      // Debug: Log transcript messages
+      if (DEBUG) {
+        console.log(
+          `[session ${sessionId}] onData received transcript message:`,
+          {
+            message: data?.message,
+            hasResults: !!data?.results,
+            resultsIsArray: Array.isArray(data?.results),
+            resultsLength: data?.results?.length,
+          },
+        );
+      }
+
       if (
         data.message === "AddTranscript" ||
         data.message === "AddPartialTranscript"
@@ -479,7 +525,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
             .join(" ");
         }
 
-        if (!transcript) return;
+        console.log(
+          `[session ${sessionId}] Extracted transcript: "${transcript}" (message: ${data.message})`,
+        );
+
+        if (!transcript) {
+          console.log(
+            `[session ${sessionId}] Empty transcript extracted. Full data:`,
+            JSON.stringify(data, null, 2),
+          );
+          return;
+        }
 
         const isFinal = data.message === "AddTranscript";
 
@@ -577,6 +633,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       let recognitionStartedFlag = false;
       const audioBuffer: Buffer[] = []; // Buffer audio until RecognitionStarted
 
+      // Save the original sendAudio method BEFORE we wrap it
+      // This must be done before the promise setup so we can use it in onRecognitionStarted
+      const originalSendAudio = client.sendAudio.bind(client);
+
       const recognitionPromise = new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(
@@ -591,31 +651,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
             `[session ${sessionId}] RecognitionStarted event received`,
           );
 
-          // Remove debug handler
-          if ((client as any)._debugMessageHandler) {
-            client.removeEventListener(
-              "receiveMessage",
-              (client as any)._debugMessageHandler,
-            );
-            delete (client as any)._debugMessageHandler;
-          }
-
-          // Remove temporary listener
-          client.removeEventListener(
-            "receiveMessage",
-            recognitionStartedHandler as any,
-          );
-
-          // Wait 500ms for socket to be fully ready before sending audio
+          // Flush buffered audio after a short delay to ensure socket is fully ready
+          // Speechmatics needs a moment after RecognitionStarted before accepting audio
           setTimeout(() => {
-            // Flush buffered audio after socket is ready
             if (audioBuffer.length > 0) {
               console.log(
                 `[session ${sessionId}] Flushing ${audioBuffer.length} buffered audio chunks`,
               );
               for (const chunk of audioBuffer) {
                 try {
-                  client.sendAudio(chunk);
+                  // Use the original method directly, not the wrapped one
+                  originalSendAudio(chunk);
                 } catch (e) {
                   console.warn(
                     `[session ${sessionId}] Error flushing buffered audio:`,
@@ -625,61 +671,109 @@ export async function registerRoutes(app: Express): Promise<Server> {
               }
               audioBuffer.length = 0; // Clear buffer
             }
-            resolve();
-          }, 500);
+          }, 200); // 200ms delay to ensure socket is ready
+
+          // Remove temporary listener
+          client.removeEventListener("error", onStartError);
+          resolve();
         };
 
-        // Speechmatics uses receiveMessage for all events - check message type
-        const recognitionStartedHandler = (event: any) => {
-          const msg = event.data;
-          
-          if (DEBUG) {
-            console.log(
-              `[session ${sessionId}] DEBUG: Received message before RecognitionStarted:`,
-              {
-                message: msg?.message,
-                type: typeof msg,
-                keys: msg ? Object.keys(msg) : [],
-                data: JSON.stringify(msg, null, 2).substring(0, 500),
-              },
-            );
-          }
+        const onStartError = (err: any) => {
+          clearTimeout(timeout);
+          client.removeEventListener("error", onStartError);
 
-          if (msg?.message === 'RecognitionStarted') {
+          console.error(
+            `[session ${sessionId}] Error event received during RecognitionStarted wait:`,
+            {
+              message: err?.message,
+              error: err,
+              type: typeof err,
+              keys: err ? Object.keys(err) : [],
+              stringified: JSON.stringify(err, Object.getOwnPropertyNames(err)),
+            },
+          );
+          reject(err);
+        };
+
+        // Speechmatics sends RecognitionStarted via receiveMessage, not a separate event
+        // Set up a handler to listen for RecognitionStarted message
+        const recognitionStartedMessageHandler = (event: any) => {
+          const msg = event.data;
+          console.log(
+            `[session ${sessionId}] recognitionStartedMessageHandler received:`,
+            {
+              message: msg?.message,
+              type: typeof msg,
+              keys: msg ? Object.keys(msg) : [],
+            },
+          );
+
+          if (msg?.message === "RecognitionStarted") {
+            console.log(
+              `[session ${sessionId}] RecognitionStarted message detected!`,
+            );
+            client.removeEventListener(
+              "receiveMessage",
+              recognitionStartedMessageHandler,
+            );
             onRecognitionStarted();
-          } else if (msg?.message === 'Error') {
+          } else if (msg?.message === "Error") {
             clearTimeout(timeout);
             client.removeEventListener(
               "receiveMessage",
-              recognitionStartedHandler as any,
+              recognitionStartedMessageHandler,
             );
             console.error(
-              `[session ${sessionId}] Error during RecognitionStarted wait:`,
-              {
-                message: msg?.reason || msg?.type,
-                error: msg,
-              },
+              `[session ${sessionId}] Error message received:`,
+              msg,
             );
-            reject(new Error(msg?.type || msg?.reason || 'Unknown error'));
+            reject(new Error(msg?.type || msg?.reason || "Unknown error"));
           }
         };
 
-        // Set up temporary listener for RecognitionStarted BEFORE starting
-        client.addEventListener("receiveMessage", recognitionStartedHandler as any);
+        // Listen for RecognitionStarted message via receiveMessage
+        client.addEventListener(
+          "receiveMessage",
+          recognitionStartedMessageHandler,
+        );
+        client.addEventListener("error", onStartError);
       });
 
       // Handle messages from Speechmatics
       // Note: In the sample code, event listeners are set up BEFORE start()
       const streamOnMessage = (event: any) => {
+        const msg = event.data;
+
+        // Only log transcript and error messages to reduce noise
+        if (
+          DEBUG &&
+          (msg?.message === "AddTranscript" ||
+            msg?.message === "AddPartialTranscript" ||
+            msg?.message === "Error")
+        ) {
+          console.log(`[session ${sessionId}] streamOnMessage received:`, {
+            message: msg?.message,
+            recognitionStartedFlag,
+          });
+        }
+
         // Only process messages after recognition has started
         if (!recognitionStartedFlag) {
-          if (DEBUG)
+          if (
+            DEBUG &&
+            msg?.message !== "Info" &&
+            msg?.message !== "AudioAdded"
+          ) {
             console.log(
-              `[session ${sessionId}] Message received before recognition started, ignoring`,
+              `[session ${sessionId}] Message received before recognition started, ignoring:`,
+              msg?.message,
             );
+          }
           return;
         }
-        onData(event.data, client);
+
+        // Process the message
+        onData(msg, client);
       };
 
       const streamOnError = (err: any) => {
@@ -698,10 +792,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // Set up message handlers BEFORE start (matching sample code pattern)
         // The sample code sets up event listeners before calling start()
         client.addEventListener("receiveMessage", streamOnMessage);
+        client.addEventListener("error", streamOnError);
 
-        // Prepare configuration - match the sample code format
-        // Note: The sample code does NOT include audio_format in start() - only transcription_config
+        // Prepare configuration
+        // For raw audio over WebSocket, audio_format is REQUIRED (per documentation)
+        // The sample code uses files which auto-detect, but we're sending raw PCM
         const config = {
+          audio_format: {
+            type: "raw",
+            encoding: "pcm_s16le",
+            sample_rate: SAMPLE_RATE,
+          },
           transcription_config: {
             language: LANGUAGE,
             enable_partials: true,
@@ -720,7 +821,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
 
         // Start the recognition session
-        // The client library handles audio format automatically based on how we send audio
+        // audio_format is required for raw PCM audio over WebSocket
         await client.start(jwt, config);
 
         console.log(
@@ -735,12 +836,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // NOW set currentStream after RecognitionStarted is confirmed
         currentStream = client;
 
-        // Save original sendAudio before wrapping it
-        const originalSendAudio = client.sendAudio.bind(client);
-        
-        // Add sendAudio method that buffers until RecognitionStarted
+        // Wrap sendAudio method to buffer until RecognitionStarted
+        // Use the originalSendAudio that was saved earlier (before wrapping)
         (client as any).sendAudio = (audioData: Buffer) => {
           if (recognitionStartedFlag) {
+            // Call the original method directly to avoid recursion
             originalSendAudio(audioData);
           } else {
             // Buffer audio until RecognitionStarted
@@ -755,12 +855,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         // Add stop method
         (client as any).stop = () => {
-          client.stopRecognition({ noTimeout: true });
+          client.stopRecognition({ noTimeout: false });
         };
 
         // Add close method
         (client as any).close = () => {
-          client.stopRecognition({ noTimeout: true });
+          client.stopRecognition({ noTimeout: false });
         };
 
         console.log(
@@ -788,7 +888,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
         // Clean up client on error
         try {
-          client.stopRecognition({ noTimeout: true });
+          client.stopRecognition({ noTimeout: false });
         } catch (e) {
           // Ignore cleanup errors
         }
@@ -1058,7 +1158,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
             safeSegmentRestart("error");
           }
         }
-      } catch (e) {
+      } catch (e: any) {
+        // Don't restart on "Socket not ready" errors - just wait a bit
+        if (e?.message?.includes("Socket not ready")) {
+          if (DEBUG) {
+            console.log(
+              `[session ${sessionId}] Socket not ready, audio will be buffered`,
+            );
+          }
+          // Audio will be buffered by the sendAudio wrapper
+          return;
+        }
         console.warn(`[session ${sessionId}] Write failed:`, e);
         if (!restarting) {
           safeSegmentRestart("error");

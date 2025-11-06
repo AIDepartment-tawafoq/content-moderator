@@ -554,14 +554,34 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Create JWT for authentication
       try {
+        // Validate API key
+        if (!SPEECHMATICS_API_KEY || SPEECHMATICS_API_KEY.trim() === "") {
+          throw new Error("SPEECHMATICS_API_KEY is not set or is empty");
+        }
+
+        console.log(`[session ${sessionId}] Creating JWT token...`);
+        // Create JWT using Speechmatics auth package
         const jwt = await createSpeechmaticsJWT({
           type: "rt",
           apiKey: SPEECHMATICS_API_KEY,
           ttl: 60, // 1 minute
         });
 
+        if (!jwt || jwt.trim() === "") {
+          throw new Error("JWT token creation returned empty string");
+        }
+
+        console.log(
+          `[session ${sessionId}] JWT created, starting recognition...`,
+        );
         // Start the recognition session
+        // Note: audio_format is required according to API docs
         await client.start(jwt, {
+          audio_format: {
+            type: "raw",
+            encoding: "pcm_s16le",
+            sample_rate: SAMPLE_RATE,
+          },
           transcription_config: {
             language: LANGUAGE,
             language_variant: LANGUAGE_VARIANT,
@@ -598,6 +618,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
           `[session ${sessionId}] Failed to start Speechmatics:`,
           error,
         );
+        console.error(`[session ${sessionId}] Error details:`, {
+          message: error?.message,
+          stack: error?.stack,
+          code: error?.code,
+          name: error?.name,
+        });
         throw error;
       }
     };
@@ -707,14 +733,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
         startHealthWatchdog();
 
         console.log(`[session ${sessionId}] Started - transcription active`);
-      } catch (error) {
+      } catch (error: any) {
         console.error(`[session ${sessionId}] Failed to start:`, error);
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            message: "Failed to start transcription",
-          }),
-        );
+        console.error(`[session ${sessionId}] Start error details:`, {
+          message: error?.message,
+          stack: error?.stack,
+          code: error?.code,
+          name: error?.name,
+        });
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message: "Failed to start transcription",
+              details: error?.message || String(error),
+            }),
+          );
+        }
         ws.close();
       }
     };

@@ -437,27 +437,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
       tSegment = setTimeout(() => {
         const actualAge = Date.now() - streamStartedAt;
         console.log(
-          `[session ${sessionId}] ⏰ TIMER: Scheduled restart triggered at ${(actualAge / 1000).toFixed(1)}s (target was ${(safeSegmentMs / 1000).toFixed(0)}s)`,
+          `[session ${sessionId}] ⏰ TIMER FIRED: Restart at ${(actualAge / 1000).toFixed(1)}s`,
         );
-        // Double-check we're not already restarting
         if (!restarting && !isPaused && !isClosing) {
           safeSegmentRestart("scheduled");
-        } else {
-          console.warn(
-            `[session ${sessionId}] Timer fired but restart blocked: restarting=${restarting}, paused=${isPaused}, closing=${isClosing}`,
-          );
         }
       }, safeSegmentMs);
-
-      // Add a verification log after a short delay to confirm timer is set
-      setTimeout(() => {
-        if (tSegment && !restarting) {
-          const remaining = safeSegmentMs - (Date.now() - streamStartedAt);
-          console.log(
-            `[session ${sessionId}] Timer verified: ${(remaining / 1000).toFixed(0)}s until restart`,
-          );
-        }
-      }, 5000);
     };
 
     // Backoff management for error recovery
@@ -623,117 +608,75 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return stream;
     };
 
-    // Segment restart - create new stream, switch, then clean up old stream
-    // Keep old stream active until new one is ready to prevent audio loss
+    // Simple restart: End old stream, create new stream, continue
+    // Core pattern: Run ~4 min → End → Recreate → Continue
     const safeSegmentRestart = async (
       reason: "scheduled" | "watchdog" | "error" | "safety",
     ) => {
-      // Block concurrent restarts to prevent race conditions
-      if (restarting || isPaused || isClosing) {
-        if (DEBUG)
-          console.log(
-            `[session ${sessionId}] Restart blocked: restarting=${restarting}, paused=${isPaused}, closing=${isClosing}`,
-          );
-        return;
-      }
+      if (restarting || isPaused || isClosing) return;
 
       restarting = true;
-      const restartStartTime = Date.now();
-      const streamAge = restartStartTime - streamStartedAt;
+      const streamAge = Date.now() - streamStartedAt;
+
+      console.log(
+        `\n[session ${sessionId}] ===== RESTART #${restartCounter + 1} (${reason}) =====\n` +
+          `Stream age: ${(streamAge / 1000).toFixed(1)}s\n`,
+      );
 
       try {
-        console.log(
-          `[session ${sessionId}] 🔄 RESTART #${restartCounter + 1}: reason=${reason}, stream_age=${(streamAge / 1000).toFixed(1)}s`,
-        );
-
-        // Ensure any pending transcript is saved
+        // 1. Save transcript
         await flushTranscript();
 
-        // Keep reference to old stream (don't clear currentStream yet - keep it active)
+        // 2. End old stream completely
         const oldStream = currentStream;
+        if (oldStream) {
+          console.log(`[session ${sessionId}] Ending old stream...`);
+          removeStreamHandlers(oldStream);
+          try {
+            if (!oldStream.destroyed) oldStream.end();
+          } catch (e) {}
+          setTimeout(() => {
+            try {
+              if (!oldStream.destroyed) oldStream.destroy();
+            } catch (e) {}
+          }, 100);
+        }
 
-        // Increment restart counter
+        // 3. Clear reference and increment counter
+        currentStream = null;
         restartCounter++;
 
-        // Create the new stream FIRST (while old stream still handles audio)
+        // 4. Create brand new stream
         console.log(`[session ${sessionId}] Creating new stream...`);
         const newStream = createStream();
 
-        // Write bridge buffer to new stream BEFORE switching
-        let bridgeWritten = 0;
+        // 5. Write bridge buffer for continuity
         for (const chunk of bridgeBuffer) {
           try {
             newStream.write(chunk);
-            bridgeWritten += chunk.length;
-          } catch (e) {
-            console.warn(`[session ${sessionId}] Bridge write failed:`, e);
-          }
-        }
-        if (bridgeWritten > 0) {
-          console.log(
-            `[session ${sessionId}] Bridge: ${(bridgeWritten / (SAMPLE_RATE * BYTES_PER_SAMPLE)).toFixed(2)}s written`,
-          );
+          } catch (e) {}
         }
 
-        // NOW switch to new stream (this is the critical moment)
+        // 6. Activate new stream
         currentStream = newStream;
-        console.log(
-          `[session ${sessionId}] ✅ Stream switched to new stream #${restartCounter}`,
-        );
-
-        // Reset the segment timer IMMEDIATELY
+        streamStartedAt = Date.now();
         setSegmentTimer();
-
-        // Reschedule the silence timer
         scheduleSilenceTimer();
-
-        // Update lastDataAt
         lastDataAt = Date.now();
 
-        // Clean up old stream AFTER new stream is active (non-blocking)
-        if (oldStream && oldStream !== currentStream) {
-          // Remove handlers to prevent old stream from interfering
-          removeStreamHandlers(oldStream);
-
-          // End and destroy old stream asynchronously
-          setTimeout(() => {
-            try {
-              if (oldStream && !oldStream.destroyed) {
-                oldStream.end();
-                setTimeout(() => {
-                  try {
-                    if (!oldStream.destroyed) {
-                      oldStream.destroy();
-                      if (DEBUG)
-                        console.log(
-                          `[session ${sessionId}] Old stream cleaned up`,
-                        );
-                    }
-                  } catch (e) {
-                    // Ignore cleanup errors
-                  }
-                }, 100);
-              }
-            } catch (e) {
-              // Ignore cleanup errors
-            }
-          }, 500); // Small delay to ensure new stream is processing
-        }
+        console.log(
+          `[session ${sessionId}] New stream #${restartCounter} active\n` +
+            `========================================\n`,
+        );
 
         resetBackoff();
-        console.log(
-          `[session ${sessionId}] ✅ RESTART COMPLETE in ${Date.now() - restartStartTime}ms`,
-        );
       } catch (error) {
-        console.error(`[session ${sessionId}] ❌ Restart failed:`, error);
-        increaseBackoff();
-        // Try to recover
+        console.error(`[session ${sessionId}] Restart error:`, error);
+        // Emergency recovery
         try {
-          if (!currentStream || currentStream.destroyed) {
-            currentStream = createStream();
-            setSegmentTimer();
-            console.log(`[session ${sessionId}] Recovery stream created`);
-          }
+          currentStream = createStream();
+          streamStartedAt = Date.now();
+          setSegmentTimer();
         } catch (e) {
           console.error(`[session ${sessionId}] Recovery failed:`, e);
         }
@@ -763,21 +706,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
     ws.on("message", (msg: Buffer | string) => {
       if (isPaused || isClosing) return;
 
-      // Safety check: Force restart if stream is close to 5-minute limit
-      // This acts as a last-ditch safety net in case the timer fails
+      // Safety check: Force restart if timer failed
       const streamAge = Date.now() - streamStartedAt;
-      if (streamAge > SEGMENT_MS - 10000 && !restarting) {
+      if (streamAge > SEGMENT_MS - 5000 && !restarting) {
         console.warn(
           `[session ${sessionId}] ⚠️ SAFETY RESTART at ${(streamAge / 1000).toFixed(1)}s`,
-        );
-        safeSegmentRestart("safety");
-        // Continue processing this message - it will go to old stream, then new stream takes over
-      }
-
-      // Critical: If stream age exceeds limit significantly, force immediate restart
-      if (streamAge > SEGMENT_MS + 10000 && !restarting) {
-        console.error(
-          `[session ${sessionId}] 🚨 CRITICAL: Stream age ${(streamAge / 1000).toFixed(1)}s exceeds limit!`,
         );
         safeSegmentRestart("safety");
       }
@@ -842,23 +775,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
         /* ignore parsing errors */
       }
 
-      // Audio data path: write to current stream and update bridge buffer
+      // Audio data: write to current stream
       const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg as string);
 
-      // Always update bridge buffer (for continuity)
+      // Update bridge buffer (for continuity across restarts)
       writeToBridge(buf);
 
-      // During restart, audio goes to old stream until new stream is ready
-      // The restart function handles the switch
-      if (!currentStream) {
-        console.warn(`[session ${sessionId}] No current stream!`);
+      // If no stream or restarting, buffer audio (will be written to new stream)
+      if (!currentStream || restarting) {
         return;
       }
 
       if (currentStream.destroyed) {
-        console.warn(
-          `[session ${sessionId}] Current stream destroyed, triggering restart`,
-        );
         if (!restarting) {
           safeSegmentRestart("error");
         }
@@ -866,13 +794,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       try {
-        // Write to current stream (will be old stream during restart transition, then new stream)
-        const written = currentStream.write(buf);
-        if (!written && DEBUG) {
-          console.log(`[session ${sessionId}] Stream buffer full`);
-        }
+        currentStream.write(buf);
       } catch (e) {
-        // Write failed - try to restart
         console.warn(`[session ${sessionId}] Write failed:`, e);
         if (!restarting) {
           safeSegmentRestart("error");

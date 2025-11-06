@@ -259,13 +259,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
     console.log(`[session ${sessionId}] WebSocket connected`);
 
     // ---- Tunables (safe defaults) ----
+    // Based on Google's sample code: STREAMING_LIMIT = 240000 (4 minutes)
+    // We restart at exactly 4 minutes to match Google's recommended approach
     const SAMPLE_RATE = 16000; // 16kHz PCM mono
     const BYTES_PER_SAMPLE = 2; // 16-bit
-    // CRITICAL FIX: Restart at 4:30 to ensure we're well before 5-minute limit
-    // Google's limit is 5 minutes, but we restart at 4:30 to be safe
-    const SEGMENT_MS = 4.5 * 60 * 1000; // 4:30 base segment length
-    const RESTART_BUFFER_MS = 30_000; // Safety margin: restart 30 seconds early (at 4:00)
-    const BRIDGE_SEC = 3; // bridge tail audio into next segment
+    // CRITICAL: Match Google sample's 4-minute limit exactly
+    // Google's limit is 5 minutes, but sample code uses 4 minutes (240000ms)
+    const STREAMING_LIMIT = 240000; // 4 minutes exactly (matches Google sample)
+    const SEGMENT_MS = STREAMING_LIMIT; // Use same value for consistency
+    const RESTART_BUFFER_MS = 0; // No buffer needed - restart at exactly 4 minutes
+    const BRIDGE_SEC = 3; // bridge tail audio into next segment (matches Google sample approach)
     const MAX_BRIDGE = BRIDGE_SEC * SAMPLE_RATE * BYTES_PER_SAMPLE;
     const FLUSH_EVERY_MS = 30_000; // periodic flush
     const SILENCE_TIMEOUT_MS = 5 * 60 * 1000; // end session if no final words this long
@@ -282,11 +285,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
     let restarting = false; // Prevent concurrent restarts
     let isPaused = false; // User-triggered pause state
     let isClosing = false; // Shutdown flag to prevent restarts during cleanup
+    let restartCounter = 0; // Track number of restarts (useful for debugging)
 
     // Rolling bridge buffer stores the last few seconds of audio
     // This audio is replayed into each new stream to ensure continuity
+    // Based on Google's sample: we bridge the last few seconds to maintain context
     let bridgeBuffer: Buffer[] = [];
     let bridgeBytes = 0;
+
+    // Track result end times for better bridging (inspired by Google sample)
+    let lastResultEndTime = 0; // Last result end time in milliseconds
+    let lastFinalResultEndTime = 0; // Last final result end time
 
     // Timers for various lifecycle management tasks
     let tSegment: NodeJS.Timeout | null = null;
@@ -414,11 +423,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
       streamStartedAt = Date.now(); // Mark when this stream's lifecycle begins
 
       // Calculate safe restart time: base segment length minus safety buffer
-      // This ensures we restart at 4:00 (4 minutes) to be well before 5-minute limit
+      // Match Google sample: restart at exactly 4 minutes (240000ms)
       const safeSegmentMs = SEGMENT_MS - RESTART_BUFFER_MS;
 
       console.log(
-        `[session ${sessionId}] Segment timer set: restart in ${(safeSegmentMs / 1000).toFixed(0)}s (at ${(safeSegmentMs / 60000).toFixed(1)} min)`,
+        `[session ${sessionId}] Segment timer set: restart in ${(safeSegmentMs / 1000).toFixed(0)}s (at ${(safeSegmentMs / 60000).toFixed(1)} min) - matching Google sample's STREAMING_LIMIT`,
       );
 
       tSegment = setTimeout(() => {
@@ -462,6 +471,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!result || !result.alternatives?.length) return;
       const transcript = (result.alternatives[0].transcript || "").trim();
       if (!transcript) return;
+
+      // Track result end time (inspired by Google sample code)
+      // This helps with bridging and maintaining continuity across restarts
+      if (result.resultEndTime) {
+        const resultSeconds = result.resultEndTime.seconds || 0;
+        // Google API uses nanos (nanoseconds), convert to milliseconds
+        const resultNanos = result.resultEndTime.nanos || 0;
+        const resultMillis = resultNanos / 1_000_000;
+        lastResultEndTime = resultSeconds * 1000 + resultMillis;
+
+        if (result.isFinal) {
+          lastFinalResultEndTime = lastResultEndTime;
+        }
+      }
 
       if (result.isFinal) {
         // Final results are added to our accumulated transcript
@@ -573,7 +596,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       try {
         console.log(
-          `[session ${sessionId}] Restart: reason=${reason}, stream_age=${(streamAge / 1000).toFixed(1)}s`,
+          `[session ${sessionId}] Restart #${restartCounter + 1}: reason=${reason}, stream_age=${(streamAge / 1000).toFixed(1)}s`,
         );
 
         // Ensure any pending transcript is saved before switching streams
@@ -581,6 +604,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         // Keep reference to old stream
         const oldStream = currentStream;
+
+        // Increment restart counter (useful for debugging, inspired by Google sample)
+        restartCounter++;
 
         // CRITICAL FIX: Remove event handlers from old stream BEFORE creating new one
         // This prevents old stream errors from interfering with the new stream
@@ -593,6 +619,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         // Critical: Write bridge buffer to new stream BEFORE reassigning currentStream
         // This ensures the new stream has context from recent audio
+        // Based on Google sample: we replay recent audio to maintain continuity
         let bridgeWritten = 0;
         for (const chunk of bridgeBuffer) {
           try {
@@ -604,7 +631,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
         if (DEBUG && bridgeWritten > 0)
           console.log(
-            `[session ${sessionId}] Bridge: ${(bridgeWritten / (SAMPLE_RATE * BYTES_PER_SAMPLE)).toFixed(2)}s written`,
+            `[session ${sessionId}] Bridge: ${(bridgeWritten / (SAMPLE_RATE * BYTES_PER_SAMPLE)).toFixed(2)}s written (last final result at ${(lastFinalResultEndTime / 1000).toFixed(1)}s)`,
           );
 
         // NOW reassign currentStream so incoming audio goes to the new stream

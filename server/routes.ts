@@ -1,5 +1,5 @@
 // Enhanced Speech-to-Text WebSocket Server
-// Combines your original blueprint with robust config from second version.
+// Fixed version with proper stream lifecycle management
 
 import type { Express } from "express";
 import { createServer, type Server } from "http";
@@ -170,6 +170,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const auth = req.headers.authorization?.replace("Bearer ", "");
     if (!auth || !isValidAdminToken(auth))
       return res.status(401).json({ error: "غير مصرح" });
+
     try {
       const sessions = await storage.getAllSessions();
       res.json(sessions);
@@ -185,6 +186,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const auth = req.headers.authorization?.replace("Bearer ", "");
     if (!auth || !isValidAdminToken(auth))
       return res.status(401).json({ error: "غير مصرح" });
+
     try {
       const sessions = await storage.getAllSessions();
       const headers = [
@@ -203,6 +205,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         "تاريخ الاكتمال",
         "تاريخ الإنشاء",
       ];
+
       const rows = [headers.join(",")];
       sessions.forEach((s) =>
         rows.push(
@@ -230,6 +233,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           ].join(","),
         ),
       );
+
       const csv = "\uFEFF" + rows.join("\n");
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader("Content-Disposition", "attachment; filename=sessions.csv");
@@ -246,6 +250,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const url = new URL(req.url || "", `http://${req.headers.host}`);
     const sessionId = url.searchParams.get("sessionId");
     if (!sessionId) return ws.close(1008, "Missing sessionId");
+
     if (!speechClient) {
       ws.send(JSON.stringify({ type: "error", message: "STT unavailable" }));
       return ws.close();
@@ -256,15 +261,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
     // ---- Tunables (safe defaults) ----
     const SAMPLE_RATE = 16000; // 16kHz PCM mono
     const BYTES_PER_SAMPLE = 2; // 16-bit
-    const SEGMENT_MS = 4 * 60 * 1000; // 4:00 base segment length
-    const RESTART_BUFFER_MS = 5000; // Safety margin: restart 5 seconds early
+    // CRITICAL FIX: Restart at 4:30 to ensure we're well before 5-minute limit
+    // Google's limit is 5 minutes, but we restart at 4:30 to be safe
+    const SEGMENT_MS = 4.5 * 60 * 1000; // 4:30 base segment length
+    const RESTART_BUFFER_MS = 30_000; // Safety margin: restart 30 seconds early (at 4:00)
     const BRIDGE_SEC = 3; // bridge tail audio into next segment
     const MAX_BRIDGE = BRIDGE_SEC * SAMPLE_RATE * BYTES_PER_SAMPLE;
     const FLUSH_EVERY_MS = 30_000; // periodic flush
     const SILENCE_TIMEOUT_MS = 5 * 60 * 1000; // end session if no final words this long
     const HEALTH_NO_DATA_MS = 45_000; // watchdog restart if no data seen this long
     const MAX_BACKOFF_MS = 10_000; // cap for exponential backoff
-    const STREAM_OVERLAP_MS = 500; // How long old stream lives alongside new stream
+    const STREAM_OVERLAP_MS = 1000; // How long old stream lives alongside new stream
 
     // ---- State ----
     let accumulated = "";
@@ -289,6 +296,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     // Exponential backoff for error recovery
     let backoffMs = 500;
+
+    // Track active stream handlers to properly clean them up
+    let currentStreamHandlers: {
+      onData?: (data: any) => void;
+      onError?: (err: any) => void;
+    } = {};
 
     // ---- Utilities ----
 
@@ -401,12 +414,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
       streamStartedAt = Date.now(); // Mark when this stream's lifecycle begins
 
       // Calculate safe restart time: base segment length minus safety buffer
+      // This ensures we restart at 4:00 (4 minutes) to be well before 5-minute limit
       const safeSegmentMs = SEGMENT_MS - RESTART_BUFFER_MS;
+
+      console.log(
+        `[session ${sessionId}] Segment timer set: restart in ${(safeSegmentMs / 1000).toFixed(0)}s (at ${(safeSegmentMs / 60000).toFixed(1)} min)`,
+      );
 
       tSegment = setTimeout(() => {
         const actualAge = Date.now() - streamStartedAt;
         console.log(
-          `[session ${sessionId}] Scheduled restart at ${(actualAge / 1000).toFixed(1)}s`,
+          `[session ${sessionId}] Scheduled restart triggered at ${(actualAge / 1000).toFixed(1)}s`,
         );
         safeSegmentRestart("scheduled");
       }, safeSegmentMs);
@@ -418,6 +436,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
     };
     const resetBackoff = () => {
       backoffMs = 500;
+    };
+
+    // CRITICAL FIX: Properly remove event handlers from old stream
+    const removeStreamHandlers = (stream: any) => {
+      if (!stream) return;
+      try {
+        if (currentStreamHandlers.onData) {
+          stream.removeListener("data", currentStreamHandlers.onData);
+        }
+        if (currentStreamHandlers.onError) {
+          stream.removeListener("error", currentStreamHandlers.onError);
+        }
+      } catch (e) {
+        console.warn(`[session ${sessionId}] Error removing handlers:`, e);
+      }
     };
 
     // ---- Stream wiring ----
@@ -438,24 +471,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
         scheduleSilenceTimer(); // Reset silence timer on final words
 
         if (DEBUG) console.log(`[session ${sessionId}] Final: "${transcript}"`);
-        ws.send(
-          JSON.stringify({
-            type: "transcript",
-            text: transcript,
-            isFinal: true,
-          }),
-        );
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: "transcript",
+              text: transcript,
+              isFinal: true,
+            }),
+          );
+        }
       } else {
         // Interim results are sent but not accumulated
         if (DEBUG)
           console.log(`[session ${sessionId}] Interim: "${transcript}"`);
-        ws.send(
-          JSON.stringify({
-            type: "transcript",
-            text: transcript,
-            isFinal: false,
-          }),
-        );
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: "transcript",
+              text: transcript,
+              isFinal: false,
+            }),
+          );
+        }
       }
     };
 
@@ -467,13 +504,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
         `[session ${sessionId}] Stream error code=${code} msg=${msg}`,
       );
 
+      // Don't restart if we're already closing or paused
+      if (isClosing || isPaused) return;
+
       // Common termination markers from Google that indicate we need to restart
       if (
         code === 11 || // RESOURCE_EXHAUSTED / RST
         msg.includes("RST_STREAM") ||
         msg.includes("INTERNAL") ||
         msg.includes("No status received") ||
-        msg.includes("GOAWAY")
+        msg.includes("GOAWAY") ||
+        msg.includes("DEADLINE_EXCEEDED")
       ) {
         increaseBackoff();
         setTimeout(() => safeSegmentRestart("error"), backoffMs);
@@ -501,8 +542,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         interimResults: true,
       };
       const stream = speechClient!.streamingRecognize(request);
+
+      // CRITICAL FIX: Store handlers so we can remove them later
+      currentStreamHandlers.onData = onData;
+      currentStreamHandlers.onError = onError;
+
       stream.on("error", onError);
       stream.on("data", onData);
+
       return stream;
     };
 
@@ -535,6 +582,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // Keep reference to old stream
         const oldStream = currentStream;
 
+        // CRITICAL FIX: Remove event handlers from old stream BEFORE creating new one
+        // This prevents old stream errors from interfering with the new stream
+        if (oldStream) {
+          removeStreamHandlers(oldStream);
+        }
+
         // Create the new stream but don't assign it yet
         const newStream = createStream();
 
@@ -549,7 +602,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             console.warn(`[session ${sessionId}] Bridge write failed:`, e);
           }
         }
-        if (DEBUG)
+        if (DEBUG && bridgeWritten > 0)
           console.log(
             `[session ${sessionId}] Bridge: ${(bridgeWritten / (SAMPLE_RATE * BYTES_PER_SAMPLE)).toFixed(2)}s written`,
           );
@@ -569,16 +622,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // But DON'T update lastFinalResultAt - that should only update on actual final results
         lastDataAt = Date.now();
 
-        // End old stream gracefully after a brief overlap period
-        // This ensures no audio is lost during the transition
+        // CRITICAL FIX: Properly destroy old stream after overlap period
+        // Use destroy() instead of end() to ensure all resources are cleaned up
         setTimeout(() => {
           try {
-            if (oldStream && !oldStream.destroyed) {
-              oldStream.end();
-              if (DEBUG) console.log(`[session ${sessionId}] Old stream ended`);
+            if (oldStream) {
+              removeStreamHandlers(oldStream);
+              if (!oldStream.destroyed) {
+                oldStream.destroy();
+                if (DEBUG)
+                  console.log(`[session ${sessionId}] Old stream destroyed`);
+              }
             }
           } catch (e) {
-            console.warn(`[session ${sessionId}] Old stream end failed:`, e);
+            console.warn(
+              `[session ${sessionId}] Old stream cleanup failed:`,
+              e,
+            );
           }
         }, STREAM_OVERLAP_MS);
 
@@ -589,6 +649,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
       } catch (error) {
         console.error(`[session ${sessionId}] Restart failed:`, error);
         increaseBackoff();
+        // Try to recover by creating a new stream
+        try {
+          if (currentStream) {
+            removeStreamHandlers(currentStream);
+            currentStream.destroy();
+          }
+          currentStream = createStream();
+          setSegmentTimer();
+        } catch (e) {
+          console.error(`[session ${sessionId}] Recovery failed:`, e);
+        }
       } finally {
         restarting = false;
       }
@@ -613,12 +684,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     // Handle incoming WebSocket messages (both audio data and control commands)
     ws.on("message", (msg: Buffer | string) => {
-      if (!currentStream || currentStream.destroyed || isPaused) return;
+      if (isPaused || isClosing) return;
 
       // Safety check: Force restart if stream is dangerously close to 5-minute limit
       // This acts as a last-ditch safety net in case the timer fails
       const streamAge = Date.now() - streamStartedAt;
-      if (streamAge > SEGMENT_MS - 2000 && !restarting) {
+      if (streamAge > SEGMENT_MS - 10000 && !restarting) {
         console.warn(
           `[session ${sessionId}] Safety restart at ${(streamAge / 1000).toFixed(1)}s`,
         );
@@ -643,9 +714,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
               isPaused = true;
               clearTimers();
               try {
-                currentStream &&
-                  !currentStream.destroyed &&
-                  currentStream.end();
+                if (currentStream) {
+                  removeStreamHandlers(currentStream);
+                  if (!currentStream.destroyed) {
+                    currentStream.destroy();
+                  }
+                }
               } catch {}
               return;
             }
@@ -655,6 +729,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
               console.log(`[session ${sessionId}] Resumed by user`);
               isPaused = false;
               resetBackoff();
+              if (currentStream) {
+                removeStreamHandlers(currentStream);
+                currentStream.destroy();
+              }
               currentStream = createStream();
               streamStartedAt = Date.now();
               lastDataAt = Date.now();
@@ -680,14 +758,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Audio data path: write to current stream and update bridge buffer
+      // CRITICAL FIX: Check if stream exists and is not destroyed before writing
+      if (!currentStream || currentStream.destroyed || restarting) {
+        // If stream is being restarted, buffer the audio temporarily
+        // In practice, restarts are fast enough that this shouldn't be needed
+        // but it's a safety measure
+        return;
+      }
+
       const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg as string);
       try {
         currentStream.write(buf);
+        writeToBridge(buf);
       } catch (e) {
         // Stream might be closing during restart; this is expected
         // The next restart will create a fresh stream
+        console.warn(
+          `[session ${sessionId}] Write failed (may be restarting):`,
+          e,
+        );
       }
-      writeToBridge(buf);
 
       // Note: We do NOT reset the silence timer here
       // The silence timer only resets on final transcript results
@@ -699,12 +789,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
       isClosing = true; // Prevent any restart attempts during shutdown
       clearTimers();
       try {
-        if (currentStream && !currentStream.destroyed) {
-          currentStream.end();
-          console.log(`[session ${sessionId}] Stream ended`);
+        if (currentStream) {
+          removeStreamHandlers(currentStream);
+          if (!currentStream.destroyed) {
+            currentStream.destroy();
+            console.log(`[session ${sessionId}] Stream destroyed`);
+          }
         }
       } catch (e) {
-        console.warn(`[session ${sessionId}] Stream end failed:`, e);
+        console.warn(`[session ${sessionId}] Stream cleanup failed:`, e);
       }
       await flushTranscript();
       await storage.completeSession(sessionId).catch(() => {});

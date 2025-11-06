@@ -6,7 +6,8 @@ import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
 import { initSessionSchema, updateSessionSchema } from "@shared/schema";
-// Using raw WebSocket for Speechmatics Realtime API
+import { RealtimeClient } from "@speechmatics/real-time-client";
+import { createSpeechmaticsJWT } from "@speechmatics/auth";
 import crypto from "crypto";
 import fs from "fs";
 
@@ -41,8 +42,6 @@ setInterval(
 // ========== Speechmatics Realtime API Configuration ==========
 
 const SPEECHMATICS_API_KEY = process.env.SPEECHMATICS_API_KEY || "";
-const SPEECHMATICS_URL =
-  process.env.SPEECHMATICS_URL || "wss://eu2.rt.speechmatics.com/v2";
 const DEBUG = ["1", "true", "yes"].includes(
   (process.env.DEBUG || "1").toLowerCase(),
 );
@@ -55,7 +54,7 @@ if (!SPEECHMATICS_API_KEY) {
   console.error("✗ SPEECHMATICS_API_KEY environment variable is required");
 }
 
-console.log(`✓ Speechmatics Realtime API configured: ${SPEECHMATICS_URL}`);
+console.log(`✓ Speechmatics Realtime API configured`);
 console.log(`✓ Language: ${LANGUAGE} (${LANGUAGE_VARIANT})`);
 
 // ========== Main App ==========
@@ -420,11 +419,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       try {
         const handlers = streamHandlers.get(stream);
         if (handlers) {
-          // WebSocket uses removeListener
-          if (stream.removeListener) {
-            stream.removeListener("message", handlers.onData);
-            stream.removeListener("error", handlers.onError);
-            stream.removeListener("close", () => {});
+          // RealtimeClient uses removeEventListener
+          if (stream.removeEventListener) {
+            stream.removeEventListener("receiveMessage", handlers.onData);
+            stream.removeEventListener("error", handlers.onError);
           }
           streamHandlers.delete(stream);
         }
@@ -436,7 +434,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     // ---- Stream wiring ----
 
     // Handle incoming transcription results from Speechmatics
-    const onData = async (message: any, sourceStream?: any) => {
+    const onData = async (data: any, sourceStream?: any) => {
       // Ignore data from old streams
       if (sourceStream && sourceStream !== currentStream) {
         if (DEBUG)
@@ -446,34 +444,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       lastDataAt = Date.now();
 
-      // Speechmatics message format
-      // Messages can be AddTranscript (final) or AddPartialTranscript (interim)
+      // Speechmatics message format from real-time-client
+      // Format: data.results.map((r) => r.alternatives?.[0].content).join(' ')
       if (
-        message.message === "AddTranscript" ||
-        message.message === "AddPartialTranscript"
+        data.message === "AddTranscript" ||
+        data.message === "AddPartialTranscript"
       ) {
-        // Extract transcript from Speechmatics format
-        // Transcript is in results array, each result has alternatives with content
+        // Extract transcript - format matches the example code
         let transcript = "";
 
-        if (message.results && Array.isArray(message.results)) {
-          // Combine all results into one transcript
-          const transcriptParts: string[] = [];
-          for (const result of message.results) {
-            if (result.alternatives && Array.isArray(result.alternatives)) {
-              for (const alt of result.alternatives) {
-                if (alt.content) {
-                  transcriptParts.push(alt.content);
-                }
-              }
-            }
-          }
-          transcript = transcriptParts.join(" ");
+        if (data.results && Array.isArray(data.results)) {
+          transcript = data.results
+            .map((r: any) => r.alternatives?.[0]?.content)
+            .filter((text: string) => text)
+            .join(" ");
         }
 
         if (!transcript) return;
 
-        const isFinal = message.message === "AddTranscript";
+        const isFinal = data.message === "AddTranscript";
 
         if (isFinal) {
           // Final results are added to our accumulated transcript
@@ -541,133 +530,76 @@ export async function registerRoutes(app: Express): Promise<Server> {
       setTimeout(() => safeSegmentRestart("error"), backoffMs);
     };
 
-    // Create a new Speechmatics Realtime WebSocket connection
-    const createStream = () => {
-      // Use the WebSocket class already imported
-      const ws = new WebSocket(SPEECHMATICS_URL, {
-        headers: {
-          Authorization: `Bearer ${SPEECHMATICS_API_KEY}`,
-        },
-      });
+    // Create a new Speechmatics Realtime client
+    const createStream = async () => {
+      const client = new RealtimeClient();
 
-      let recognitionStarted = false;
-      let audioSeqNo = 0;
-
-      // Handle WebSocket messages
-      const streamOnMessage = (data: any) => {
-        try {
-          const message = JSON.parse(data.toString());
-
-          if (message.message === "RecognitionStarted") {
-            recognitionStarted = true;
-            console.log(
-              `[session ${sessionId}] Speechmatics recognition started: ${message.id}`,
-            );
-          } else if (message.message === "AudioAdded") {
-            // Audio was accepted
-            if (DEBUG)
-              console.log(
-                `[session ${sessionId}] AudioAdded: seq_no=${message.seq_no}`,
-              );
-          } else if (
-            message.message === "AddTranscript" ||
-            message.message === "AddPartialTranscript"
-          ) {
-            // Forward transcription messages to our handler
-            onData(message, ws);
-          } else if (message.message === "Error") {
-            console.error(
-              `[session ${sessionId}] Speechmatics error: ${message.reason} (type: ${message.type})`,
-            );
-            onError(new Error(message.reason), ws);
-          } else if (message.message === "Warning") {
-            console.warn(
-              `[session ${sessionId}] Speechmatics warning: ${message.reason} (type: ${message.type})`,
-            );
-          } else if (message.message === "EndOfTranscript") {
-            console.log(`[session ${sessionId}] EndOfTranscript received`);
-          }
-        } catch (e) {
-          console.warn(`[session ${sessionId}] Failed to parse message:`, e);
-        }
+      // Handle messages from Speechmatics
+      const streamOnMessage = (event: any) => {
+        onData(event.data, client);
       };
 
       const streamOnError = (err: any) => {
-        onError(err, ws);
-      };
-
-      const streamOnClose = () => {
-        console.log(`[session ${sessionId}] Speechmatics WebSocket closed`);
-        if (currentStream === ws && !isClosing) {
-          // Connection closed unexpectedly, restart
-          safeSegmentRestart("error");
-        }
+        onError(err, client);
       };
 
       // Store handlers
-      streamHandlers.set(ws, {
+      streamHandlers.set(client, {
         onData: streamOnMessage,
         onError: streamOnError,
       });
 
-      ws.on("message", streamOnMessage);
-      ws.on("error", streamOnError);
-      ws.on("close", streamOnClose);
+      client.addEventListener("receiveMessage", streamOnMessage);
+      client.addEventListener("error", streamOnError);
 
-      // Send StartRecognition message once connected
-      ws.on("open", () => {
-        console.log(`[session ${sessionId}] Speechmatics WebSocket connected`);
+      // Create JWT for authentication
+      try {
+        const jwt = await createSpeechmaticsJWT({
+          type: "rt",
+          apiKey: SPEECHMATICS_API_KEY,
+          ttl: 60, // 1 minute
+        });
 
-        const startMessage = {
-          message: "StartRecognition",
-          audio_format: {
-            type: "raw",
-            encoding: "pcm_s16le",
-            sample_rate: SAMPLE_RATE,
-          },
+        // Start the recognition session
+        await client.start(jwt, {
           transcription_config: {
             language: LANGUAGE,
             language_variant: LANGUAGE_VARIANT,
             output_locale: LANGUAGE_VARIANT,
             enable_partials: true,
-            max_delay: 2.0,
+            operating_point: "enhanced",
           },
+        });
+
+        console.log(`[session ${sessionId}] Speechmatics recognition started`);
+
+        // Add sendAudio method
+        (client as any).sendAudio = (audioData: Buffer) => {
+          client.sendAudio(audioData);
         };
 
-        ws.send(JSON.stringify(startMessage));
-        console.log(`[session ${sessionId}] StartRecognition sent`);
-      });
+        // Add stop method
+        (client as any).stop = () => {
+          client.stopRecognition({ noTimeout: false });
+        };
 
-      // Store audio sequence number function
-      (ws as any).sendAudio = (audioData: Buffer) => {
-        if (ws.readyState === 1 && recognitionStarted) {
-          // WebSocket.OPEN = 1
-          audioSeqNo++;
-          // Send binary audio data
-          ws.send(audioData);
-        }
-      };
+        // Add close method
+        (client as any).close = () => {
+          client.stopRecognition({ noTimeout: false });
+        };
 
-      (ws as any).stop = () => {
-        if (ws.readyState === 1) {
-          // WebSocket.OPEN = 1
-          const endMessage = {
-            message: "EndOfStream",
-            last_seq_no: audioSeqNo,
-          };
-          ws.send(JSON.stringify(endMessage));
-        }
-      };
+        console.log(
+          `[session ${sessionId}] New Speechmatics stream created (stream #${restartCounter + 1})`,
+        );
 
-      (ws as any).close = () => {
-        ws.close();
-      };
-
-      console.log(
-        `[session ${sessionId}] New Speechmatics stream created (stream #${restartCounter + 1})`,
-      );
-
-      return ws;
+        return client;
+      } catch (error: any) {
+        console.error(
+          `[session ${sessionId}] Failed to start Speechmatics:`,
+          error,
+        );
+        throw error;
+      }
     };
 
     // Simple restart: End old stream, create new stream, continue
@@ -719,14 +651,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         // 4. Create brand new stream
         console.log(`[session ${sessionId}] Creating new stream...`);
-        const newStream = createStream();
+        const newStream = await createStream();
 
         // 5. Write bridge buffer for continuity
         for (const chunk of bridgeBuffer) {
           try {
             // Speechmatics uses sendAudio method
-            if (newStream.sendAudio) {
-              newStream.sendAudio(chunk);
+            if ((newStream as any).sendAudio) {
+              (newStream as any).sendAudio(chunk);
             }
           } catch (e) {
             console.warn(`[session ${sessionId}] Bridge write failed:`, e);
@@ -750,7 +682,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         console.error(`[session ${sessionId}] Restart error:`, error);
         // Emergency recovery
         try {
-          currentStream = createStream();
+          currentStream = await createStream();
           streamStartedAt = Date.now();
           setSegmentTimer();
         } catch (e) {
@@ -764,16 +696,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
     // ---- Lifecycle ----
 
     // Initialize the first stream and all monitoring systems
-    const start = () => {
-      currentStream = createStream();
-      streamStartedAt = Date.now();
-      lastFinalResultAt = Date.now();
-      startPeriodicFlush();
-      setSegmentTimer();
-      scheduleSilenceTimer();
-      startHealthWatchdog();
+    const start = async () => {
+      try {
+        currentStream = await createStream();
+        streamStartedAt = Date.now();
+        lastFinalResultAt = Date.now();
+        startPeriodicFlush();
+        setSegmentTimer();
+        scheduleSilenceTimer();
+        startHealthWatchdog();
 
-      console.log(`[session ${sessionId}] Started - transcription active`);
+        console.log(`[session ${sessionId}] Started - transcription active`);
+      } catch (error) {
+        console.error(`[session ${sessionId}] Failed to start:`, error);
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Failed to start transcription",
+          }),
+        );
+        ws.close();
+      }
     };
 
     start();
@@ -830,13 +773,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 if ((currentStream as any).close)
                   (currentStream as any).close();
               }
-              currentStream = createStream();
-              streamStartedAt = Date.now();
-              lastDataAt = Date.now();
-              startPeriodicFlush();
-              setSegmentTimer();
-              scheduleSilenceTimer(); // Restart silence timer on resume
-              startHealthWatchdog();
+              // Create stream asynchronously
+              createStream()
+                .then((stream) => {
+                  currentStream = stream;
+                  streamStartedAt = Date.now();
+                  lastDataAt = Date.now();
+                  startPeriodicFlush();
+                  setSegmentTimer();
+                  scheduleSilenceTimer();
+                  startHealthWatchdog();
+                })
+                .catch((err) => {
+                  console.error(
+                    `[session ${sessionId}] Failed to resume:`,
+                    err,
+                  );
+                });
               return;
             }
 

@@ -11,6 +11,8 @@
     "db:push": "drizzle-kit push"
   },
   "dependencies": {
+    "@speechmatics/real-time-client": "^8.2.0",
+    "@speechmatics/auth": "^1.0.0",
     "@google-cloud/speech": "^7.2.1",
     "@hookform/resolvers": "^3.10.0",
     "@jridgewell/trace-mapping": "^0.3.25",

@@ -241,17 +241,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
     );
 
     // ---- Tunables (safe defaults) ----
-    // Speechmatics doesn't have a 5-minute limit, but we restart periodically for reliability
+    // Speechmatics supports long sessions without needing periodic restarts
     const SAMPLE_RATE = 16000; // 16kHz PCM mono
     const BYTES_PER_SAMPLE = 2; // 16-bit
-    const STREAMING_LIMIT = 240000; // 4 minutes - restart periodically for reliability
-    const SEGMENT_MS = STREAMING_LIMIT;
-    const RESTART_BUFFER_MS = 0;
-    const BRIDGE_SEC = 3; // bridge tail audio into next segment
-    const MAX_BRIDGE = BRIDGE_SEC * SAMPLE_RATE * BYTES_PER_SAMPLE;
     const FLUSH_EVERY_MS = 30_000; // periodic flush
     const SILENCE_TIMEOUT_MS = 5 * 60 * 1000; // end session if no final words this long
-    const HEALTH_NO_DATA_MS = 45_000; // watchdog restart if no data seen this long
     const MAX_BACKOFF_MS = 10_000; // cap for exponential backoff
 
     // ---- State ----
@@ -259,27 +253,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
     let currentStream: any | null = null;
     let lastDataAt = Date.now();
     let lastFinalResultAt = Date.now(); // Track when we last got a FINAL result
-    let streamStartedAt = Date.now(); // Track when the current stream was created
-    let restarting = false; // Prevent concurrent restarts
     let isPaused = false; // User-triggered pause state
     let isClosing = false; // Shutdown flag to prevent restarts during cleanup
-    let restartCounter = 0; // Track number of restarts (useful for debugging)
-
-    // Rolling bridge buffer stores the last few seconds of audio
-    // This audio is replayed into each new stream to ensure continuity
-    // Based on Google's sample: we bridge the last few seconds to maintain context
-    let bridgeBuffer: Buffer[] = [];
-    let bridgeBytes = 0;
-
-    // Track result end times for better bridging (inspired by Google sample)
-    let lastResultEndTime = 0; // Last result end time in milliseconds
-    let lastFinalResultEndTime = 0; // Last final result end time
 
     // Timers for various lifecycle management tasks
-    let tSegment: NodeJS.Timeout | null = null;
     let tFlush: NodeJS.Timeout | null = null;
     let tSilence: NodeJS.Timeout | null = null;
-    let tHealth: NodeJS.Timeout | null = null;
 
     // Exponential backoff for error recovery
     let backoffMs = 500;
@@ -298,10 +277,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     // Clear all active timers to prevent memory leaks and unexpected behavior
     const clearTimers = () => {
-      if (tSegment) {
-        clearTimeout(tSegment);
-        tSegment = null;
-      }
       if (tFlush) {
         clearInterval(tFlush);
         tFlush = null;
@@ -309,10 +284,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (tSilence) {
         clearTimeout(tSilence);
         tSilence = null;
-      }
-      if (tHealth) {
-        clearInterval(tHealth);
-        tHealth = null;
       }
     };
 
@@ -369,61 +340,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       tFlush = setInterval(flushTranscript, FLUSH_EVERY_MS);
     };
 
-    // Health watchdog detects when the stream stops receiving data
-    // This catches edge cases where Google silently stops sending data
-    const startHealthWatchdog = () => {
-      if (tHealth) clearInterval(tHealth);
-      tHealth = setInterval(
-        () => {
-          if (isPaused || isClosing) return;
-          const idle = Date.now() - lastDataAt;
-          if (idle > HEALTH_NO_DATA_MS) {
-            console.warn(
-              `[session ${sessionId}] Health watchdog: No data for ${(idle / 1000).toFixed(0)}s — forcing restart`,
-            );
-            safeSegmentRestart("watchdog");
-          }
-        },
-        Math.min(HEALTH_NO_DATA_MS / 3, 15000),
-      ); // Check more frequently
-    };
-
-    // Add audio chunk to the rolling bridge buffer
-    // This buffer maintains the last few seconds of audio for stream continuity
-    const writeToBridge = (buf: Buffer) => {
-      bridgeBuffer.push(buf);
-      bridgeBytes += buf.length;
-      // Keep only the most recent BRIDGE_SEC seconds of audio
-      while (bridgeBytes > MAX_BRIDGE) {
-        const dropped = bridgeBuffer.shift();
-        bridgeBytes -= dropped?.length || 0;
-      }
-    };
-
-    // Set up the segment restart timer with proper tracking
-    // This is critical: we restart BEFORE hitting Google's 5-minute limit
-    const setSegmentTimer = () => {
-      if (tSegment) clearTimeout(tSegment);
-      streamStartedAt = Date.now(); // Mark when this stream's lifecycle begins
-
-      // Calculate safe restart time: base segment length minus safety buffer
-      // Match Google sample: restart at exactly 4 minutes (240000ms)
-      const safeSegmentMs = SEGMENT_MS - RESTART_BUFFER_MS;
-
-      console.log(
-        `[session ${sessionId}] Segment timer set: restart in ${(safeSegmentMs / 1000).toFixed(0)}s (at ${(safeSegmentMs / 60000).toFixed(1)} min) - matching Google sample's STREAMING_LIMIT`,
-      );
-
-      tSegment = setTimeout(() => {
-        const actualAge = Date.now() - streamStartedAt;
-        console.log(
-          `[session ${sessionId}] ⏰ TIMER FIRED: Restart at ${(actualAge / 1000).toFixed(1)}s`,
-        );
-        if (!restarting && !isPaused && !isClosing) {
-          safeSegmentRestart("scheduled");
-        }
-      }, safeSegmentMs);
-    };
 
     // Backoff management for error recovery
     const increaseBackoff = () => {
@@ -492,8 +408,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
           return;
         }
 
-        // For other errors, trigger restart
-        if (!restarting && !isClosing) {
+        // For other errors, trigger error handler
+        if (!isClosing) {
           onError(new Error(`${errorType}: ${errorReason}`), sourceStream);
         }
         return;
@@ -581,25 +497,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const msg = err?.message || String(err);
-      console.warn(`[session ${sessionId}] Speechmatics error: ${msg}`);
+      console.error(`[session ${sessionId}] Speechmatics error: ${msg}`);
 
       if (isClosing || isPaused) return;
 
-      // Restart on connection errors
-      if (
-        msg.includes("ECONNRESET") ||
-        msg.includes("ETIMEDOUT") ||
-        msg.includes("WebSocket") ||
-        msg.includes("connection")
-      ) {
-        increaseBackoff();
-        setTimeout(() => safeSegmentRestart("error"), backoffMs);
-        return;
+      // Send error to client
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: msg,
+          }),
+        );
       }
-
-      // Other errors: try restart with backoff
-      increaseBackoff();
-      setTimeout(() => safeSegmentRestart("error"), backoffMs);
     };
 
     // Create a new Speechmatics Realtime client
@@ -672,26 +582,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             }
           }, 200); // 200ms delay to ensure socket is ready
 
-          // Remove temporary listener
-          client.removeEventListener("error", onStartError);
           resolve();
-        };
-
-        const onStartError = (err: any) => {
-          clearTimeout(timeout);
-          client.removeEventListener("error", onStartError);
-
-          console.error(
-            `[session ${sessionId}] Error event received during RecognitionStarted wait:`,
-            {
-              message: err?.message,
-              error: err,
-              type: typeof err,
-              keys: err ? Object.keys(err) : [],
-              stringified: JSON.stringify(err, Object.getOwnPropertyNames(err)),
-            },
-          );
-          reject(err);
         };
 
         // Speechmatics sends RecognitionStarted via receiveMessage, not a separate event
@@ -737,7 +628,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
           "receiveMessage",
           recognitionStartedMessageHandler,
         );
-        client.addEventListener("error", onStartError);
       });
 
       // Handle messages from Speechmatics
@@ -755,14 +645,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         onData(msg, client);
       };
 
-      const streamOnError = (err: any) => {
-        onError(err, client);
-      };
-
       // Store handlers
       streamHandlers.set(client, {
         onData: streamOnMessage,
-        onError: streamOnError,
+        onError: () => {}, // Errors come through receiveMessage, not a separate event
       });
 
       try {
@@ -771,15 +657,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // Set up message handlers BEFORE start (matching sample code pattern)
         // The sample code sets up event listeners before calling start()
         client.addEventListener("receiveMessage", streamOnMessage);
-        client.addEventListener("error", streamOnError);
 
         // Prepare configuration
         // For raw audio over WebSocket, audio_format is REQUIRED (per documentation)
         // The sample code uses files which auto-detect, but we're sending raw PCM
         const config = {
           audio_format: {
-            type: "raw",
-            encoding: "pcm_s16le",
+            type: "raw" as const,
+            encoding: "pcm_s16le" as const,
             sample_rate: SAMPLE_RATE,
           },
           transcription_config: {
@@ -828,16 +713,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         // Add stop method
         (client as any).stop = () => {
-          client.stopRecognition({ noTimeout: false });
+          client.stopRecognition();
         };
 
         // Add close method
         (client as any).close = () => {
-          client.stopRecognition({ noTimeout: false });
+          client.stopRecognition();
         };
 
         console.log(
-          `[session ${sessionId}] New Speechmatics stream created (stream #${restartCounter + 1})`,
+          `[session ${sessionId}] New Speechmatics stream created`,
         );
 
         return client;
@@ -861,7 +746,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
         // Clean up client on error
         try {
-          client.stopRecognition({ noTimeout: false });
+          client.stopRecognition();
         } catch (e) {
           // Ignore cleanup errors
         }
@@ -869,100 +754,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
     };
 
-    // Simple restart: End old stream, create new stream, continue
-    // Core pattern: Run ~4 min → End → Recreate → Continue
-    const safeSegmentRestart = async (
-      reason: "scheduled" | "watchdog" | "error" | "safety",
-    ) => {
-      if (restarting || isPaused || isClosing) return;
-
-      restarting = true;
-      const streamAge = Date.now() - streamStartedAt;
-
-      console.log(
-        `\n[session ${sessionId}] ===== RESTART #${restartCounter + 1} (${reason}) =====\n` +
-          `Stream age: ${(streamAge / 1000).toFixed(1)}s\n`,
-      );
-
-      try {
-        // 1. Save transcript
-        await flushTranscript();
-
-        // 2. End old stream completely
-        const oldStream = currentStream;
-        if (oldStream) {
-          console.log(`[session ${sessionId}] Ending old stream...`);
-          removeStreamHandlers(oldStream);
-          try {
-            // Send EndOfStream and close WebSocket
-            if (oldStream.readyState === 1) {
-              // WebSocket.OPEN = 1
-              if ((oldStream as any).stop) {
-                (oldStream as any).stop();
-              }
-            }
-            if ((oldStream as any).close) {
-              (oldStream as any).close();
-            }
-          } catch (e) {
-            console.warn(
-              `[session ${sessionId}] Error stopping old stream:`,
-              e,
-            );
-          }
-        }
-
-        // 3. Clear reference and increment counter
-        currentStream = null;
-        restartCounter++;
-
-        // 4. Create brand new stream
-        console.log(`[session ${sessionId}] Creating new stream...`);
-        const newStream = await createStream();
-
-        // 5. Write bridge buffer for continuity
-        for (const chunk of bridgeBuffer) {
-          try {
-            // Speechmatics uses sendAudio method
-            if ((newStream as any).sendAudio) {
-              (newStream as any).sendAudio(chunk);
-            }
-          } catch (e) {
-            console.warn(`[session ${sessionId}] Bridge write failed:`, e);
-          }
-        }
-
-        // 6. Activate new stream
-        currentStream = newStream;
-        streamStartedAt = Date.now();
-        if (ENABLE_SCHEDULED_RESTARTS) {
-          setSegmentTimer();
-        }
-        scheduleSilenceTimer();
-        lastDataAt = Date.now();
-
-        console.log(
-          `[session ${sessionId}] New stream #${restartCounter} active\n` +
-            `========================================\n`,
-        );
-
-        resetBackoff();
-      } catch (error) {
-        console.error(`[session ${sessionId}] Restart error:`, error);
-        // Emergency recovery
-        try {
-          currentStream = await createStream();
-          streamStartedAt = Date.now();
-          if (ENABLE_SCHEDULED_RESTARTS) {
-            setSegmentTimer();
-          }
-        } catch (e) {
-          console.error(`[session ${sessionId}] Recovery failed:`, e);
-        }
-      } finally {
-        restarting = false;
-      }
-    };
 
     // ---- Lifecycle ----
 
@@ -978,14 +769,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
           `[session ${sessionId}] Step 2: Stream created successfully`,
         );
 
-        streamStartedAt = Date.now();
         lastFinalResultAt = Date.now();
         startPeriodicFlush();
-        if (ENABLE_SCHEDULED_RESTARTS) {
-          setSegmentTimer();
-        }
         scheduleSilenceTimer();
-        startHealthWatchdog();
 
         console.log(`[session ${sessionId}] ===== TRANSCRIPTION ACTIVE =====`);
       } catch (error: any) {
@@ -1021,17 +807,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     // Handle incoming WebSocket messages (both audio data and control commands)
     ws.on("message", (msg: Buffer | string) => {
       if (isPaused || isClosing) return;
-
-      if (ENABLE_SCHEDULED_RESTARTS) {
-        // Safety check: Force restart if timer failed
-        const streamAge = Date.now() - streamStartedAt;
-        if (streamAge > SEGMENT_MS - 5000 && !restarting) {
-          console.warn(
-            `[session ${sessionId}] ⚠️ SAFETY RESTART at ${(streamAge / 1000).toFixed(1)}s`,
-          );
-          safeSegmentRestart("safety");
-        }
-      }
 
       // Control messages are JSON (typically small)
       // Audio data is binary (typically larger buffers)
@@ -1076,14 +851,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
               createStream()
                 .then((stream) => {
                   currentStream = stream;
-                  streamStartedAt = Date.now();
                   lastDataAt = Date.now();
                   startPeriodicFlush();
-                  if (ENABLE_SCHEDULED_RESTARTS) {
-                    setSegmentTimer();
-                  }
                   scheduleSilenceTimer();
-                  startHealthWatchdog();
                 })
                 .catch((err) => {
                   console.error(
@@ -1091,13 +861,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
                     err,
                   );
                 });
-              return;
-            }
-
-            // Handle manual restart command
-            if (cmd?.type === "restart_segment") {
-              console.log(`[session ${sessionId}] Manual restart requested`);
-              safeSegmentRestart("scheduled");
               return;
             }
           } catch {
@@ -1111,11 +874,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Audio data: write to current stream
       const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg as string);
 
-      // Update bridge buffer (for continuity across restarts)
-      writeToBridge(buf);
-
-      // If no stream or restarting, buffer audio (will be written to new stream)
-      if (!currentStream || restarting) {
+      // If no stream, ignore audio
+      if (!currentStream) {
         return;
       }
 
@@ -1132,20 +892,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
           console.warn(
             `[session ${sessionId}] Stream not ready (state: ${currentStream.readyState})`,
           );
-          if (!restarting) {
-            safeSegmentRestart("error");
-          }
         }
       } catch (e: any) {
-        // Don't restart on "Socket not ready" errors - just wait a bit
+        // Don't error on "Socket not ready" errors - just wait a bit
         if (e?.message?.includes("Socket not ready")) {
           // Audio will be buffered by the sendAudio wrapper - silently handle
           return;
         }
         console.warn(`[session ${sessionId}] Write failed:`, e);
-        if (!restarting) {
-          safeSegmentRestart("error");
-        }
       }
 
       // Note: We do NOT reset the silence timer here

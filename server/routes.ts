@@ -245,7 +245,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const SAMPLE_RATE = 16000; // 16kHz PCM mono
     const BYTES_PER_SAMPLE = 2; // 16-bit
     const FLUSH_EVERY_MS = 30_000; // periodic flush
-    const SILENCE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // end session after 2 hours of silence
+    const SILENCE_TIMEOUT_MS = 5 * 60 * 1000; // end session after 5 minutes of silence
     const MAX_BACKOFF_MS = 10_000; // cap for exponential backoff
 
     // ---- State ----

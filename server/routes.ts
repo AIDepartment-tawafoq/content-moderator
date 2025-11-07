@@ -43,7 +43,7 @@ setInterval(
 
 const SPEECHMATICS_API_KEY = process.env.SPEECHMATICS_API_KEY || "";
 const DEBUG = ["1", "true", "yes"].includes(
-  (process.env.DEBUG || "1").toLowerCase(),
+  (process.env.DEBUG || "0").toLowerCase(),
 );
 
 // Language configuration - Arabic
@@ -315,9 +315,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const timeoutAt = new Date(
         Date.now() + SILENCE_TIMEOUT_MS,
       ).toLocaleTimeString();
-      console.log(
-        `[session ${sessionId}] Silence timer scheduled, will timeout at ${timeoutAt}`,
-      );
+      // console.log(
+      //   `[session ${sessionId}] Silence timer scheduled, will timeout at ${timeoutAt}`,
+      // );
 
       tSilence = setTimeout(async () => {
         const silenceDuration = Date.now() - lastFinalResultAt;
@@ -534,7 +534,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           scheduleSilenceTimer();
 
           // Log final transcripts (important for debugging)
-          console.log(`[session ${sessionId}] ✓ Final: "${transcript}"`);
+          // console.log(`[session ${sessionId}] ✓ Final: "${transcript}"`);
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(
               JSON.stringify({

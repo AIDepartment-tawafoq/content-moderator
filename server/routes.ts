@@ -45,6 +45,9 @@ const SPEECHMATICS_API_KEY = process.env.SPEECHMATICS_API_KEY || "";
 const DEBUG = ["1", "true", "yes"].includes(
   (process.env.DEBUG || "0").toLowerCase(),
 );
+const ENABLE_SCHEDULED_RESTARTS = ["1", "true", "yes"].includes(
+  (process.env.ENABLE_SCHEDULED_RESTARTS || "0").toLowerCase(),
+);
 
 // Language configuration - Arabic
 const LANGUAGE = process.env.STT_LANG || "ar";
@@ -56,6 +59,11 @@ if (!SPEECHMATICS_API_KEY) {
 
 console.log(`✓ Speechmatics Realtime API configured`);
 console.log(`✓ Language: ${LANGUAGE} (${LANGUAGE_VARIANT})`);
+console.log(
+  ENABLE_SCHEDULED_RESTARTS
+    ? "• Scheduled restarts ENABLED (legacy behaviour)"
+    : "• Scheduled restarts DISABLED (using long-lived Speechmatics stream)",
+);
 
 // ========== Main App ==========
 export async function registerRoutes(app: Express): Promise<Server> {
@@ -315,9 +323,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const timeoutAt = new Date(
         Date.now() + SILENCE_TIMEOUT_MS,
       ).toLocaleTimeString();
-      // console.log(
-      //   `[session ${sessionId}] Silence timer scheduled, will timeout at ${timeoutAt}`,
-      // );
+      if (DEBUG) {
+        console.log(
+          `[session ${sessionId}] Silence timer scheduled, will timeout at ${timeoutAt}`,
+        );
+      }
 
       tSilence = setTimeout(async () => {
         const silenceDuration = Date.now() - lastFinalResultAt;
@@ -534,7 +544,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           scheduleSilenceTimer();
 
           // Log final transcripts (important for debugging)
-          // console.log(`[session ${sessionId}] ✓ Final: "${transcript}"`);
+          console.log(`[session ${sessionId}] ✓ Final: "${transcript}"`);
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(
               JSON.stringify({
@@ -925,7 +935,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // 6. Activate new stream
         currentStream = newStream;
         streamStartedAt = Date.now();
-        setSegmentTimer();
+        if (ENABLE_SCHEDULED_RESTARTS) {
+          setSegmentTimer();
+        }
         scheduleSilenceTimer();
         lastDataAt = Date.now();
 
@@ -941,7 +953,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         try {
           currentStream = await createStream();
           streamStartedAt = Date.now();
-          setSegmentTimer();
+          if (ENABLE_SCHEDULED_RESTARTS) {
+            setSegmentTimer();
+          }
         } catch (e) {
           console.error(`[session ${sessionId}] Recovery failed:`, e);
         }
@@ -967,7 +981,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         streamStartedAt = Date.now();
         lastFinalResultAt = Date.now();
         startPeriodicFlush();
-        setSegmentTimer();
+        if (ENABLE_SCHEDULED_RESTARTS) {
+          setSegmentTimer();
+        }
         scheduleSilenceTimer();
         startHealthWatchdog();
 
@@ -1006,13 +1022,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
     ws.on("message", (msg: Buffer | string) => {
       if (isPaused || isClosing) return;
 
-      // Safety check: Force restart if timer failed
-      const streamAge = Date.now() - streamStartedAt;
-      if (streamAge > SEGMENT_MS - 5000 && !restarting) {
-        console.warn(
-          `[session ${sessionId}] ⚠️ SAFETY RESTART at ${(streamAge / 1000).toFixed(1)}s`,
-        );
-        safeSegmentRestart("safety");
+      if (ENABLE_SCHEDULED_RESTARTS) {
+        // Safety check: Force restart if timer failed
+        const streamAge = Date.now() - streamStartedAt;
+        if (streamAge > SEGMENT_MS - 5000 && !restarting) {
+          console.warn(
+            `[session ${sessionId}] ⚠️ SAFETY RESTART at ${(streamAge / 1000).toFixed(1)}s`,
+          );
+          safeSegmentRestart("safety");
+        }
       }
 
       // Control messages are JSON (typically small)
@@ -1061,7 +1079,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
                   streamStartedAt = Date.now();
                   lastDataAt = Date.now();
                   startPeriodicFlush();
-                  setSegmentTimer();
+                  if (ENABLE_SCHEDULED_RESTARTS) {
+                    setSegmentTimer();
+                  }
                   scheduleSilenceTimer();
                   startHealthWatchdog();
                 })

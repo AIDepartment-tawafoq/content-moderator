@@ -245,7 +245,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const SAMPLE_RATE = 16000; // 16kHz PCM mono
     const BYTES_PER_SAMPLE = 2; // 16-bit
     const FLUSH_EVERY_MS = 30_000; // periodic flush
-    const SILENCE_TIMEOUT_MS = 5 * 60 * 1000; // end session if no final words this long
+    const SILENCE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // end session after 2 hours of silence
     const MAX_BACKOFF_MS = 10_000; // cap for exponential backoff
 
     // ---- State ----
@@ -288,7 +288,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     };
 
     // Schedule automatic session completion after extended silence
-    // This only resets when we receive final transcript results, not on interim results
+    // Resets on ANY transcript activity (both partials and finals) to keep active sessions alive
     const scheduleSilenceTimer = () => {
       if (tSilence) clearTimeout(tSilence);
       const timeoutAt = new Date(
@@ -471,7 +471,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
             );
           }
         } else {
-          // Partial/interim results - only log if DEBUG enabled
+          // Partial/interim results - reset silence timer to keep session alive
+          scheduleSilenceTimer();
+          
+          // Only log if DEBUG enabled
           if (DEBUG)
             console.log(`[session ${sessionId}] Partial: "${transcript}"`);
           if (ws.readyState === WebSocket.OPEN) {

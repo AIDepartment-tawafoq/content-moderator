@@ -340,7 +340,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       tFlush = setInterval(flushTranscript, FLUSH_EVERY_MS);
     };
 
-
     // Backoff management for error recovery
     const increaseBackoff = () => {
       backoffMs = Math.min(MAX_BACKOFF_MS, Math.ceil(backoffMs * 1.8));
@@ -460,7 +459,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           scheduleSilenceTimer();
 
           // Log final transcripts (important for debugging)
-          console.log(`[session ${sessionId}] ✓ Final: "${transcript}"`);
+          // console.log(`[session ${sessionId}] ✓ Final: "${transcript}"`);
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(
               JSON.stringify({
@@ -473,7 +472,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         } else {
           // Partial/interim results - reset silence timer to keep session alive
           scheduleSilenceTimer();
-          
+
           // Only log if DEBUG enabled
           if (DEBUG)
             console.log(`[session ${sessionId}] Partial: "${transcript}"`);
@@ -724,9 +723,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           client.stopRecognition();
         };
 
-        console.log(
-          `[session ${sessionId}] New Speechmatics stream created`,
-        );
+        console.log(`[session ${sessionId}] New Speechmatics stream created`);
 
         return client;
       } catch (error: any) {
@@ -756,7 +753,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
         throw error;
       }
     };
-
 
     // ---- Lifecycle ----
 
